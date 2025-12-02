@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "Hub75_esp32",
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"glcdfont.c": "cpp"
+		}
+	}
+}
