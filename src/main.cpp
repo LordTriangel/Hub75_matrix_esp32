@@ -7,10 +7,11 @@
 #include "bitmap.h"      // Unsere neue Header-Datei für die Bitmap
 #include <HTTPClient.h>  // NEU: Für den Wetter-Abruf
 #include <ArduinoJson.h> // NEU: Zum Verstehen der Wetter-Daten
+#include "secrets.h"     // Credentials
 
 // 1. WETTER EINSTELLUNGEN (München Maxvorstadt)
 
-String openWeatherMapApiKey = "008007c24f86988c633c6b98d67bcaa3"; // key
+String openWeatherMapApiKey = OWM_API_KEY; // key
 
 // Koordinaten für München Maxvorstadt
 String lat = "48.148";
@@ -32,12 +33,19 @@ HUB75_I2S_CFG mxconfig(
 // Es wird in setup() initialisiert
 MatrixPanel_I2S_DMA *dma_display = nullptr;
 
-// WLAN-Einstellungen (aus Doku)
-const char *ssid = "HM-iotroam";
-const char *password = "R3T1_PV4HM_ESP32!";
+// WLAN-Einstellungen
+#define DEBUG_NETWORK // Uncomment for home testing
+
+#ifdef DEBUG_NETWORK
+  const char *ssid = WIFI_SSID_HOME;
+  const char *password = WIFI_PASS_HOME;
+#else
+  const char *ssid = WIFI_SSID_WORK;
+  const char *password = WIFI_PASS_WORK;
+#endif
 
 // MQTT-Einstellungen
-const char *mqtt_server = "10.19.68.2"; // Beibehalten der bestehenden IP
+const char *mqtt_server = MQTT_SERVER_IP;
 const int mqtt_port = 1883;
 
 // Zohair
@@ -82,8 +90,21 @@ const long wetterUpdateInterval = 900000; // 15 Minuten (in Millisekunden)
 
 // Timer für MQTT Reconnect (Non-blocking)
 unsigned long lastMqttReconnectAttempt = 0;
-bool logoAnzeigeAktiv = false;
-unsigned long logoAnzeigeTimer = 0;
+
+// State Machine Definitions
+enum DisplayState {
+  STATE_MAIN,      // Standard view (Sun, Battery, etc.)
+  STATE_LOGO,      // HM Logo
+  STATE_FULLSCREEN // New processed data view (Slideshow)
+};
+
+DisplayState currentState = STATE_MAIN;
+unsigned long stateTimer = 0;
+
+// Durations (in milliseconds)
+const unsigned long DURATION_MAIN = 10000;      // 10 seconds
+const unsigned long DURATION_LOGO = 2000;       // 2 seconds
+const unsigned long DURATION_FULLSCREEN = 5000; // 5 seconds
 
 // --- Speicher für 7-Tage-PV-Historie ---
 // Wir legen einen Pointer an. Der Speicher wird in setup() im PSRAM reserviert.
@@ -337,7 +358,7 @@ void zeichneUhrzeit()
   // Text-Eigenschaften
   dma_display->setTextSize(2);                                     // "emnisschen größer"
   dma_display->setTextColor(dma_display->color565(255, 255, 255)); // Weiß
-
+  
   // Position "mitte (x) und embisschen unten (y)"
   // TextSize 2 ist 10px breit pro Zeichen (5*2). "14:35" = 5 Zeichen = 50px
   // Mitte X = (64 - 50) / 2 = 7
@@ -421,86 +442,119 @@ void updateDisplay()
 {
   unsigned long jetzt = millis();
 
-  // Prüfen, ob es Zeit ist, das Logo anzuzeigen (alle 10 Sekunden)
-  if (!logoAnzeigeAktiv && (jetzt - logoAnzeigeTimer >= 10000)) {
-    logoAnzeigeAktiv = true;
-    logoAnzeigeTimer = jetzt; // Timer für die nächsten 10 Sekunden neu starten
+  // --- 1. STATE MACHINE TRANSITIONS ---
+  switch (currentState) {
+    case STATE_MAIN:
+      if (jetzt - stateTimer >= DURATION_MAIN) {
+        currentState = STATE_LOGO;
+        stateTimer = jetzt;
+        dma_display->fillScreen(0); // Clear screen on transition
+      }
+      break;
+
+    case STATE_LOGO:
+      if (jetzt - stateTimer >= DURATION_LOGO) {
+        currentState = STATE_FULLSCREEN;
+        stateTimer = jetzt;
+        dma_display->fillScreen(0);
+      }
+      break;
+
+    case STATE_FULLSCREEN:
+      if (jetzt - stateTimer >= DURATION_FULLSCREEN) {
+        currentState = STATE_MAIN;
+        stateTimer = jetzt;
+        dma_display->fillScreen(0);
+      }
+      break;
   }
 
-  // Wenn das Logo aktiv ist, prüfe, wie lange es schon angezeigt wird
-  if (logoAnzeigeAktiv) {
-    if (jetzt - logoAnzeigeTimer < 10000) { // Logo für 2 Sekunden anzeigen
+  // --- 2. STATE DRAWING ---
+  switch (currentState) {
+    case STATE_MAIN:
+      // Linkes Panel (Grafiken) löschen
+      dma_display->fillRect(0, 0, 64, 64, 0);
+
+      // Zohair
+      //  Wir rufen unsere neue Funktion auf und übergeben ihr
+      //  den aktuellen Animations-Status
+      zeichneSonne(sonnenStrahlStatus);
+      // akku auffüllen
+      zeichneAkku();
+      // Zohair
+      zeichneUhrzeit();
+      // Rechtes Panel (Text) löschen
+      dma_display->fillRect(64, 0, 64, 64, 0);
+      ///*
+      dma_display->setTextSize(1);
+
+      // --- Saftkiste ---
+      dma_display->setTextColor(dma_display->color565(0, 255, 100)); // Grün
+      dma_display->setCursor(1 + 64, 2);
+      dma_display->print("SOC:");
+      dma_display->setCursor(28 + 64, 2);
+      dma_display->print(g_batt_soc, 1); // 1 Nachkommastelle
+      dma_display->print("%");
+
+      dma_display->setTextColor(dma_display->color565(0, 200, 255)); // Cyan
+      dma_display->setCursor(1 + 64, 12);
+      dma_display->print("Batt:");
+      dma_display->setCursor(28 + 64, 12);
+      dma_display->print(g_batt_voltage, 2); // 2 Nachkommastellen
+      dma_display->print("V");
+
+      dma_display->setCursor(1 + 64, 22);
+      dma_display->print("Last:");
+      dma_display->setCursor(28 + 64, 22);
+      dma_display->print(g_batt_current, 1);
+      dma_display->print("A");
+
+      // --- PV-Laderegler ---
+      dma_display->setTextColor(dma_display->color565(255, 255, 0)); // Gelb
+      dma_display->setCursor(1 + 64, 36);
+      dma_display->print("PV1:");
+      dma_display->setCursor(28 + 64, 36);
+      dma_display->print(g_pv1_voltage, 1);
+      dma_display->print("V");
+
+      dma_display->setCursor(1 + 64, 46);
+      dma_display->print("PV2:");
+      dma_display->setCursor(28 + 64, 46);
+      dma_display->print(g_pv2_voltage, 1);
+      dma_display->print("V");
+      //*/
+
+      // 3tes Panel
+      //  3tes Panel (Text) löschen
+      dma_display->fillRect(128, 0, 64, 64, 0);
+      zeichneWetter(138, 22);
+      dma_display->setTextColor(dma_display->color565(255, 200, 200)); //
+      // dma_display->setCursor(1+128, 12);
+      // dma_display->print("hallo");
+      dma_display->setTextSize(2);
+      //dma_display->setFont()
+      dma_display->setCursor(1 + 128, 0);
+      //dma_display->print("༼ つ ◕_◕ ༽つ");
+
+      dma_display->print(int(round(g_batt_power)));
+      dma_display->print("W");
+      break;
+
+    case STATE_LOGO:
       dma_display->drawRGBBitmap(0, 0, HMlogo, 128, 64);
-      logoAnzeigeAktiv = false; // 2 Sekunden sind um, Logo deaktivieren
-    }
-  
-  }else{
-  // Linkes Panel (Grafiken) löschen
-  dma_display->fillRect(0, 0, 64, 64, 0);
+      break;
 
-  // Zohair
-  //  Wir rufen unsere neue Funktion auf und übergeben ihr
-  //  den aktuellen Animations-Status
-  zeichneSonne(sonnenStrahlStatus);
-  // akku auffüllen
-  zeichneAkku();
-  // Zohair
-  zeichneUhrzeit();
-  // Rechtes Panel (Text) löschen
-  dma_display->fillRect(64, 0, 64, 64, 0);
-  ///*
-  dma_display->setTextSize(1);
-
-  // --- Saftkiste ---
-  dma_display->setTextColor(dma_display->color565(0, 255, 100)); // Grün
-  dma_display->setCursor(1 + 64, 2);
-  dma_display->print("SOC:");
-  dma_display->setCursor(28 + 64, 2);
-  dma_display->print(g_batt_soc, 1); // 1 Nachkommastelle
-  dma_display->print("%");
-
-  dma_display->setTextColor(dma_display->color565(0, 200, 255)); // Cyan
-  dma_display->setCursor(1 + 64, 12);
-  dma_display->print("Batt:");
-  dma_display->setCursor(28 + 64, 12);
-  dma_display->print(g_batt_voltage, 2); // 2 Nachkommastellen
-  dma_display->print("V");
-
-  dma_display->setCursor(1 + 64, 22);
-  dma_display->print("Last:");
-  dma_display->setCursor(28 + 64, 22);
-  dma_display->print(g_batt_current, 1);
-  dma_display->print("A");
-
-  // --- PV-Laderegler ---
-  dma_display->setTextColor(dma_display->color565(255, 255, 0)); // Gelb
-  dma_display->setCursor(1 + 64, 36);
-  dma_display->print("PV1:");
-  dma_display->setCursor(28 + 64, 36);
-  dma_display->print(g_pv1_voltage, 1);
-  dma_display->print("V");
-
-  dma_display->setCursor(1 + 64, 46);
-  dma_display->print("PV2:");
-  dma_display->setCursor(28 + 64, 46);
-  dma_display->print(g_pv2_voltage, 1);
-  dma_display->print("V");
-  //*/
-
-  // 3tes Panel
-  //  3tes Panel (Text) löschen
-  dma_display->fillRect(128, 0, 64, 64, 0);
-  zeichneWetter(138, 22);
-  dma_display->setTextColor(dma_display->color565(255, 200, 200)); // 
-  // dma_display->setCursor(1+128, 12);
-  // dma_display->print("hallo");
-  dma_display->setTextSize(2);
-  //dma_display->setFont()
-  dma_display->setCursor(1 + 128, 0);
-  //dma_display->print("༼ つ ◕_◕ ༽つ");
-  
-  dma_display->print(int(round(g_batt_power)));
-  dma_display->print("W");
+    case STATE_FULLSCREEN:
+      // Placeholder for Fullscreen Mode
+      // You can implement your slideshow logic here
+      dma_display->setTextSize(2);
+      dma_display->setTextColor(dma_display->color565(255, 0, 255)); // Magenta
+      dma_display->setCursor(10, 20);
+      dma_display->print("SLIDESHOW");
+      dma_display->setCursor(10, 40);
+      dma_display->setTextSize(1);
+      dma_display->print("Place your data here");
+      break;
   }
 }
 
