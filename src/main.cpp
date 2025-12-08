@@ -7,6 +7,10 @@
 #include "bitmap.h"      // Unsere neue Header-Datei für die Bitmap
 #include <HTTPClient.h>  // NEU: Für den Wetter-Abruf
 #include <ArduinoJson.h> // NEU: Zum Verstehen der Wetter-Daten
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+#include <AnimatedGIF.h> // NEU: GIF Library
+#include <LittleFS.h>    // NEU: Dateisystem
 #include "secrets.h"     // Credentials
 
 // 1. WETTER EINSTELLUNGEN (München Maxvorstadt)
@@ -34,7 +38,7 @@ HUB75_I2S_CFG mxconfig(
 MatrixPanel_I2S_DMA *dma_display = nullptr;
 
 // WLAN-Einstellungen
-#define DEBUG_NETWORK // Uncomment for home testing
+//#define DEBUG_NETWORK // Uncomment for home testing
 
 #ifdef DEBUG_NETWORK
   const char *ssid = WIFI_SSID_HOME;
@@ -71,6 +75,16 @@ float g_batt_power = -1.0;
 // Wetterdaten (Startwert -99 bedeutet: noch keine Daten)
 float g_temperatur = -99.0;
 
+// INA219 Sensor
+Adafruit_INA219 ina219;
+int w_chg_cnt = 0;              // Anzahl der ladenden Geräte (Wireless Charging)
+float current_mA_prev = 0;      // Vorheriger Stromwert für Sprungerkennung
+unsigned long lastInaUpdate = 0;// Timer für INA Check
+
+// GIF Animation
+AnimatedGIF gif;
+const char *gifFilename = "/warp_chg_192x64.gif"; // Datei muss im 'data' Ordner liegen
+
 //  Timer für Display-Aktualisierung
 unsigned long lastDisplayUpdate = 0;
 const long displayUpdateInterval = 500; // Display alle 100ms neu zeichnen
@@ -95,16 +109,19 @@ unsigned long lastMqttReconnectAttempt = 0;
 enum DisplayState {
   STATE_MAIN,      // Standard view (Sun, Battery, etc.)
   STATE_LOGO,      // HM Logo
-  STATE_FULLSCREEN // New processed data view (Slideshow)
+  STATE_FULLSCREEN,// New processed data view (Slideshow)
+  STATE_CHARGING_ANIMATION // NEU: Lade-Animation
 };
 
 DisplayState currentState = STATE_MAIN;
+DisplayState previousState = STATE_MAIN; // Um zurückzukehren
 unsigned long stateTimer = 0;
 
 // Durations (in milliseconds)
 const unsigned long DURATION_MAIN = 10000;      // 10 seconds
 const unsigned long DURATION_LOGO = 2000;       // 2 seconds
 const unsigned long DURATION_FULLSCREEN = 5000; // 5 seconds
+const unsigned long DURATION_CHARGING = 5000;   // 5 Sekunden GIF abspielen
 
 // --- Speicher für 7-Tage-PV-Historie ---
 // Wir legen einen Pointer an. Der Speicher wird in setup() im PSRAM reserviert.
@@ -156,6 +173,193 @@ void holeWetter()
     }
     http.end(); // Verbindung schließen
   }
+}
+
+// CALLBACK: Datei-Funktionen für LittleFS (Brücke für AnimatedGIF Library)
+// -------------------------------------------------------------------------
+void *GIFOpenFile(const char *fname, int32_t *pSize)
+{
+  File f = LittleFS.open(fname);
+  if (f)
+  {
+    *pSize = f.size();
+    // Trick: Wir geben neuen Speicher zurück, der das File-Objekt hält.
+    // Sauberer wäre ein "new File(f)", aber File ist oft nur ein Wrapper.
+    // Wir nutzen hier einfach new File Kopie.
+    File *fnew = new File(f); 
+    return (void *)fnew;
+  }
+  return NULL;
+}
+
+void GIFCloseFile(void *pHandle)
+{
+  File *f = (File *)pHandle;
+  if (f)
+  {
+    f->close();
+    delete f;
+  }
+}
+
+int32_t GIFReadFile(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen)
+{
+  int32_t iBytesRead;
+  iBytesRead = iLen;
+  File *f = (File *)pFile->fHandle;
+  // Note: If you read a file all the way to the last byte, seek() stops working
+  if ((pFile->iSize - pFile->iPos) < iLen)
+    iBytesRead = pFile->iSize - pFile->iPos - 1; // <-- ugly work-around
+  if (iBytesRead <= 0)
+    return 0;
+  iBytesRead = (int32_t)f->read(pBuf, iBytesRead);
+  pFile->iPos = f->position();
+  return iBytesRead;
+}
+
+int32_t GIFSeekFile(GIFFILE *pFile, int32_t iPosition)
+{
+  File *f = (File *)pFile->fHandle;
+  f->seek(iPosition);
+  pFile->iPos = (int32_t)f->position();
+  return pFile->iPos;
+}
+// -------------------------------------------------------------------------
+
+// CALLBACK: GIF Zeichnen
+// Wird von der Library für jeden Pixel-Block aufgerufen
+void GIFDraw(GIFDRAW *pDraw)
+{
+  uint8_t *s;
+  uint16_t *d, *usPalette, usTemp[320];
+  int x, y, iWidth;
+
+  iWidth = pDraw->iWidth;
+  if (iWidth > PANEL_WIDTH * PANELS_CHAINED)
+    iWidth = PANEL_WIDTH * PANELS_CHAINED;
+
+  usPalette = pDraw->pPalette;
+  y = pDraw->iY + pDraw->y; // current line
+
+  s = pDraw->pPixels;
+  if (pDraw->ucDisposalMethod == 2) // restore to background color
+  {
+    for (x = 0; x < iWidth; x++)
+    {
+      if (s[x] == pDraw->ucTransparent)
+        s[x] = pDraw->ucBackground;
+    }
+    pDraw->ucHasTransparency = 0;
+  }
+  // Apply the new pixels to the main image
+  if (pDraw->ucHasTransparency) // if transparency used
+  {
+    uint8_t *pEnd, c, ucTransparent = pDraw->ucTransparent;
+    int x, iCount;
+    pEnd = s + pDraw->iWidth;
+    x = 0;
+    iCount = 0; // count non-transparent pixels
+    while (x < pDraw->iWidth)
+    {
+      c = ucTransparent - 1;
+      d = usTemp;
+      while (c != ucTransparent && s < pEnd)
+      {
+        c = *s++;
+        if (c == ucTransparent) // done, stop
+        {
+          s--; // back up to treat it like transparent
+        }
+        else // opaque
+        {
+          *d++ = usPalette[c];
+          iCount++;
+        }
+      }           // while looking for opaque block
+      if (iCount) // any opaque pixels?
+      {
+        for (int i = 0; i < iCount; i++)
+        {
+          dma_display->drawPixel(x + i, y, usTemp[i]); // <--- Aufs Display zeichnen!
+        }
+        x += iCount;
+        iCount = 0;
+      }
+      // no, look for a run of transparent pixels
+      c = ucTransparent;
+      while (c == ucTransparent && s < pEnd)
+      {
+        c = *s++;
+        if (c == ucTransparent)
+          x++;
+        else
+          s--;
+      }
+    }
+  }
+  else
+  {
+    s = pDraw->pPixels;
+    // Translate the 8-bit pixels through the RGB565 palette (already byte reversed)
+    for (x = 0; x < pDraw->iWidth; x++)
+    {
+      dma_display->drawPixel(x, y, usPalette[*s++]);
+    }
+  }
+}
+
+// FUNKTION: Wireless Charging Check (INA219)
+// ------------------------------------------------------
+void checkWirelessChargingCurrent() {
+  // Aktuellen Strom in mA lesen
+  float current_mA = ina219.getCurrent_mA();
+  
+  // Differenz zum letzten Wert
+  float diff = current_mA - current_mA_prev;
+
+  bool triggerAnimation = false;
+
+  // Debug Ausgabe
+  // Serial.print("Strom: "); Serial.print(current_mA); Serial.print(" mA | Diff: "); Serial.println(diff);
+
+  // Schwelle für "Sprung" festlegen (1 Ampere = 1000mA)
+  // Positive Flanke (Gerät aufgelegt)
+  if (diff >= 1000.0) {
+    w_chg_cnt++;
+    Serial.print("Sprung nach OBEN erkannt! Neuer Count: ");
+    Serial.println(w_chg_cnt);
+    triggerAnimation = true;
+  }
+  // Negative Flanke (Gerät weggenommen)
+  // Wir prüfen auf <= -1000, damit auch ein Abfall erkannt wird
+  else if (diff <= -1000.0) {
+    w_chg_cnt--;
+    if (w_chg_cnt < 0) w_chg_cnt = 0; // Nicht unter 0 gehen
+    Serial.print("Sprung nach UNTEN erkannt! Neuer Count: ");
+    Serial.println(w_chg_cnt);
+    triggerAnimation = true; // Auch beim Wegnehmen Animation zeigen? (Optional)
+    // Wenn NUR beim Auflegen: if (diff >= 1000.0) triggerAnimation = true; else triggerAnimation = false;
+  }
+
+  // Animation starten, wenn was passiert ist UND wir nicht schon animieren
+  if (triggerAnimation && currentState != STATE_CHARGING_ANIMATION) {
+     previousState = currentState; // Merken wo wir waren
+     currentState = STATE_CHARGING_ANIMATION;
+     stateTimer = millis();
+     // GIF öffnen mit unseren neuen Callback-Funktionen
+     if (gif.open(gifFilename, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw))
+     {
+        Serial.println("GIF gestartet!");
+        dma_display->fillScreen(0);
+     } else {
+        Serial.println("Fehler: Konnte GIF nicht öffnen! (Liegt es in /data/warp_chg_192x64.gif?)");
+        // Fallback: Einfach im aktuellen State bleiben oder nur Text zeigen
+        currentState = previousState; 
+     }
+  }
+
+  // Aktuellen Wert als "Vorherigen" für das nächste Mal speichern
+  current_mA_prev = current_mA;
 }
 
 /**
@@ -260,6 +464,7 @@ void setup_wifi()
  */
 void zeichneAkku()
 {
+  g_batt_soc=100.0;
 
   // 1. Definiere Farben
   uint16_t weiss = dma_display->color565(255, 255, 255);
@@ -540,20 +745,43 @@ void updateDisplay()
       dma_display->print("W");
       break;
 
+    case STATE_CHARGING_ANIMATION:
+      // GIF Frame abspielen
+      if (gif.playFrame(true, NULL)) // true = wait if needed (delay handling)
+      {
+         // Frame wurde gezeichnet.
+      }
+      else
+      {
+         // GIF ist am Ende (oder Loop zu Ende)
+         // Wir setzen es zurück für den nächsten Loop (falls wir loopen wollen) oder beenden es.
+         gif.reset(); 
+      }
+
+      // Prüfen ob Zeit abgelaufen ist
+      if (jetzt - stateTimer >= DURATION_CHARGING) {
+        gif.close(); // Wichtig: Datei schließen
+        currentState = previousState; // Zurück zum alten State
+        stateTimer = jetzt;
+        dma_display->fillScreen(0);
+      }
+      break;
+
     case STATE_LOGO:
-      dma_display->drawRGBBitmap(0, 0, HMlogo, 128, 64);
+      dma_display->drawRGBBitmap(32, 0, HMlogo, 128, 64);
       break;
 
     case STATE_FULLSCREEN:
       // Placeholder for Fullscreen Mode
       // You can implement your slideshow logic here
       dma_display->setTextSize(2);
-      dma_display->setTextColor(dma_display->color565(255, 0, 255)); // Magenta
-      dma_display->setCursor(10, 20);
-      dma_display->print("SLIDESHOW");
-      dma_display->setCursor(10, 40);
+      dma_display->setTextColor(dma_display->color565(255, 50, 255)); // Magenta
+      dma_display->setCursor(2, 0);
+      dma_display->print("Energie Generiert heute:");
+      dma_display->setCursor(1, 34);
       dma_display->setTextSize(1);
-      dma_display->print("Place your data here");
+      dma_display->setTextColor(dma_display->color565(167, 165, 232)); //lavendel
+      dma_display->print("100 Handyladungen ");
       break;
   }
 }
@@ -618,6 +846,28 @@ void setup()
   // Wetter sofort beim Start holen
   holeWetter();
 
+  // INA219 Initialisierung
+  if (!ina219.begin()) {
+    Serial.println("Fehler: INA219 Chip nicht gefunden!");
+  } else {
+    Serial.println("INA219 Chip gefunden.");
+    // Optional: Kalibrierung für höhere Stromstärken, falls nötig
+    // ina219.setCalibration_32V_2A(); // Oder _32V_1A(), je nach Shunt
+    // Standard ist 32V_2A, was bis 3.2A misst. Für mehr Range Doku prüfen.
+    // Wir lesen hier erstmal den ersten Wert, damit der "Sprung" nicht beim Boot passiert
+    current_mA_prev = ina219.getCurrent_mA();
+  }
+
+  // LittleFS starten
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS konnte nicht gestartet werden. Formatiere...");
+    LittleFS.format();
+    LittleFS.begin();
+  }
+  
+  // GIF vor-initialisieren (Buffer)
+  gif.begin(LITTLE_ENDIAN_PIXELS); // Unsere Palette ist schon Little Endian durch color565 logic (meistens)
+
   // Zohair
 
   client.setServer(mqtt_server, mqtt_port);
@@ -678,7 +928,7 @@ void loop()
         Serial.print("fehlgeschlagen, rc=");
         Serial.print(client.state());
         Serial.println(" Erneuter Versuch in 5 Sek.");
-        dma_display->print("FAIL");
+        //dma_display->print("FAIL");
       }
     }
   }
@@ -710,6 +960,12 @@ void loop()
     {
       sonnenStrahlStatus = 0;
     }
+  }
+  
+  // INA219 Check (jede Sekunde)
+  if (currentMillis_Sonne - lastInaUpdate >= 1000) {
+    lastInaUpdate = currentMillis_Sonne;
+    checkWirelessChargingCurrent();
   }
   // Zohair
 
