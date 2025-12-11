@@ -3,15 +3,21 @@
 #include <PubSubClient.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Adafruit_GFX.h>
+#include <Fonts/FreeMonoBold24pt7b.h>
 #include <time.h>
 #include "bitmap.h"      // Unsere neue Header-Datei für die Bitmap
 #include <HTTPClient.h>  // NEU: Für den Wetter-Abruf
 #include <ArduinoJson.h> // NEU: Zum Verstehen der Wetter-Daten
 #include <Wire.h>
 #include <Adafruit_INA219.h>
-#include <AnimatedGIF.h> // NEU: GIF Library
-#include <LittleFS.h>    // NEU: Dateisystem
+#include "frames.h"      // NEU: Unsere Bitmap Frames
 #include "secrets.h"     // Credentials
+
+// I2C Pins für INA219
+// Matrix nutzt: 3,4,5,6,7,8,9,10,11,15,16,18,40,41
+// Wir nehmen 13 und 14
+#define I2C_SDA_PIN 13
+#define I2C_SCL_PIN 14
 
 // 1. WETTER EINSTELLUNGEN (München Maxvorstadt)
 
@@ -81,13 +87,12 @@ int w_chg_cnt = 0;              // Anzahl der ladenden Geräte (Wireless Chargin
 float current_mA_prev = 0;      // Vorheriger Stromwert für Sprungerkennung
 unsigned long lastInaUpdate = 0;// Timer für INA Check
 
-// GIF Animation
-AnimatedGIF gif;
-const char *gifFilename = "/warp_chg_192x64.gif"; // Datei muss im 'data' Ordner liegen
+// GIF Globals entfernt
+// const char *gifFilename = "/warp_chg_192x64.gif";
 
 //  Timer für Display-Aktualisierung
 unsigned long lastDisplayUpdate = 0;
-const long displayUpdateInterval = 500; // Display alle 100ms neu zeichnen
+unsigned long currentDisplayInterval = 400; // Standard: 500ms. Wird bei Animation auf 20ms verkürzt.
 
 // Zohair
 // Globale Variablen für die Sonnen-Animation
@@ -110,7 +115,11 @@ enum DisplayState {
   STATE_MAIN,      // Standard view (Sun, Battery, etc.)
   STATE_LOGO,      // HM Logo
   STATE_FULLSCREEN,// New processed data view (Slideshow)
-  STATE_CHARGING_ANIMATION // NEU: Lade-Animation
+  STATE_CHARGING_ANIMATION, // NEU: Lade-Animation
+  STATE_AKKU2,     // Akkuanzeige 2 (10s)
+  STATE_TIME_LARGE,// Uhrzeit groß (5s)
+  STATE_TEMP_LARGE,// Temperatur groß (5s)
+  STATE_POWER_LARGE// Leistung groß (5s)
 };
 
 DisplayState currentState = STATE_MAIN;
@@ -122,6 +131,10 @@ const unsigned long DURATION_MAIN = 10000;      // 10 seconds
 const unsigned long DURATION_LOGO = 2000;       // 2 seconds
 const unsigned long DURATION_FULLSCREEN = 5000; // 5 seconds
 const unsigned long DURATION_CHARGING = 5000;   // 5 Sekunden GIF abspielen
+const unsigned long DURATION_AKKU2 = 10000;     // 10 seconds
+const unsigned long DURATION_TIME_LARGE = 5000; // 5 seconds
+const unsigned long DURATION_TEMP_LARGE = 5000; // 5 seconds
+const unsigned long DURATION_POWER_LARGE = 5000;// 5 seconds
 
 // --- Speicher für 7-Tage-PV-Historie ---
 // Wir legen einen Pointer an. Der Speicher wird in setup() im PSRAM reserviert.
@@ -129,6 +142,9 @@ const int HISTORY_POINTS_PER_DAY = 288; // Alle 5 Minuten ein Wert (24 * 60 / 5)
 const int HISTORY_DAYS = 7;
 const int TOTAL_HISTORY_POINTS = HISTORY_POINTS_PER_DAY * HISTORY_DAYS;
 float *g_pv_power_history = nullptr; // Pointer für unser PSRAM-Array
+
+bool ina219_active = false;
+
 
 // FUNKTION: WETTER ABRUFEN
 // ------------------------------------------------------
@@ -175,147 +191,41 @@ void holeWetter()
   }
 }
 
-// CALLBACK: Datei-Funktionen für LittleFS (Brücke für AnimatedGIF Library)
-// -------------------------------------------------------------------------
-void *GIFOpenFile(const char *fname, int32_t *pSize)
-{
-  File f = LittleFS.open(fname);
-  if (f)
-  {
-    *pSize = f.size();
-    // Trick: Wir geben neuen Speicher zurück, der das File-Objekt hält.
-    // Sauberer wäre ein "new File(f)", aber File ist oft nur ein Wrapper.
-    // Wir nutzen hier einfach new File Kopie.
-    File *fnew = new File(f); 
-    return (void *)fnew;
-  }
-  return NULL;
-}
+// (Animation Settings)
+int currentFrameIndex = 0;
+unsigned long lastFrameTime = 0;
+const int FRAME_DELAY = 100; // Zeit pro Frame in ms
+uint16_t *frames_psram[38]; // Pointer-Array für PSRAM
+bool psramInitialized = false;
 
-void GIFCloseFile(void *pHandle)
-{
-  File *f = (File *)pHandle;
-  if (f)
-  {
-    f->close();
-    delete f;
-  }
-}
-
-int32_t GIFReadFile(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen)
-{
-  int32_t iBytesRead;
-  iBytesRead = iLen;
-  File *f = (File *)pFile->fHandle;
-  // Note: If you read a file all the way to the last byte, seek() stops working
-  if ((pFile->iSize - pFile->iPos) < iLen)
-    iBytesRead = pFile->iSize - pFile->iPos - 1; // <-- ugly work-around
-  if (iBytesRead <= 0)
-    return 0;
-  iBytesRead = (int32_t)f->read(pBuf, iBytesRead);
-  pFile->iPos = f->position();
-  return iBytesRead;
-}
-
-int32_t GIFSeekFile(GIFFILE *pFile, int32_t iPosition)
-{
-  File *f = (File *)pFile->fHandle;
-  f->seek(iPosition);
-  pFile->iPos = (int32_t)f->position();
-  return pFile->iPos;
-}
-// -------------------------------------------------------------------------
-
-// CALLBACK: GIF Zeichnen
-// Wird von der Library für jeden Pixel-Block aufgerufen
-void GIFDraw(GIFDRAW *pDraw)
-{
-  uint8_t *s;
-  uint16_t *d, *usPalette, usTemp[320];
-  int x, y, iWidth;
-
-  iWidth = pDraw->iWidth;
-  if (iWidth > PANEL_WIDTH * PANELS_CHAINED)
-    iWidth = PANEL_WIDTH * PANELS_CHAINED;
-
-  usPalette = pDraw->pPalette;
-  y = pDraw->iY + pDraw->y; // current line
-
-  s = pDraw->pPixels;
-  if (pDraw->ucDisposalMethod == 2) // restore to background color
-  {
-    for (x = 0; x < iWidth; x++)
-    {
-      if (s[x] == pDraw->ucTransparent)
-        s[x] = pDraw->ucBackground;
-    }
-    pDraw->ucHasTransparency = 0;
-  }
-  // Apply the new pixels to the main image
-  if (pDraw->ucHasTransparency) // if transparency used
-  {
-    uint8_t *pEnd, c, ucTransparent = pDraw->ucTransparent;
-    int x, iCount;
-    pEnd = s + pDraw->iWidth;
-    x = 0;
-    iCount = 0; // count non-transparent pixels
-    while (x < pDraw->iWidth)
-    {
-      c = ucTransparent - 1;
-      d = usTemp;
-      while (c != ucTransparent && s < pEnd)
-      {
-        c = *s++;
-        if (c == ucTransparent) // done, stop
-        {
-          s--; // back up to treat it like transparent
-        }
-        else // opaque
-        {
-          *d++ = usPalette[c];
-          iCount++;
-        }
-      }           // while looking for opaque block
-      if (iCount) // any opaque pixels?
-      {
-        for (int i = 0; i < iCount; i++)
-        {
-          dma_display->drawPixel(x + i, y, usTemp[i]); // <--- Aufs Display zeichnen!
-        }
-        x += iCount;
-        iCount = 0;
-      }
-      // no, look for a run of transparent pixels
-      c = ucTransparent;
-      while (c == ucTransparent && s < pEnd)
-      {
-        c = *s++;
-        if (c == ucTransparent)
-          x++;
-        else
-          s--;
-      }
-    }
-  }
-  else
-  {
-    s = pDraw->pPixels;
-    // Translate the 8-bit pixels through the RGB565 palette (already byte reversed)
-    for (x = 0; x < pDraw->iWidth; x++)
-    {
-      dma_display->drawPixel(x, y, usPalette[*s++]);
-    }
-  }
-}
+// (GIF Callbacks entfernt)
 
 // FUNKTION: Wireless Charging Check (INA219)
 // ------------------------------------------------------
 void checkWirelessChargingCurrent() {
+  // Wenn kein Sensor da ist, brechen wir hier ab (verhindert I2C-Fehler/Verzögerung)
+  if (!ina219_active) {
+      // fehlerbehandlung
+  }
+
   // Aktuellen Strom in mA lesen
-  float current_mA = ina219.getCurrent_mA();
+  float current_mA = 0;
+  if (ina219_active) {
+      current_mA = ina219.getCurrent_mA();
+  }
   
   // Differenz zum letzten Wert
   float diff = current_mA - current_mA_prev;
+
+  // --- DEBUG TRIGGER (da kein Sensor vorhanden) ---
+  // Simuliere alle 30 Sekunden einen "Auflege-Vorgang"
+  static unsigned long lastDebugTrigger = 0;
+  if (millis() - lastDebugTrigger > 30000) {
+     diff = 2000.0; // Künstlicher Sprung von +2A
+     lastDebugTrigger = millis();
+     Serial.println("DEBUG: Künstlicher Ladestart ausgelöst!");
+  }
+  // ----------------------------------------------
 
   bool triggerAnimation = false;
 
@@ -345,17 +255,11 @@ void checkWirelessChargingCurrent() {
   if (triggerAnimation && currentState != STATE_CHARGING_ANIMATION) {
      previousState = currentState; // Merken wo wir waren
      currentState = STATE_CHARGING_ANIMATION;
+     currentDisplayInterval = 20; // TURBO-MODUS AN (20ms)
      stateTimer = millis();
-     // GIF öffnen mit unseren neuen Callback-Funktionen
-     if (gif.open(gifFilename, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw))
-     {
-        Serial.println("GIF gestartet!");
-        dma_display->fillScreen(0);
-     } else {
-        Serial.println("Fehler: Konnte GIF nicht öffnen! (Liegt es in /data/warp_chg_192x64.gif?)");
-        // Fallback: Einfach im aktuellen State bleiben oder nur Text zeigen
-        currentState = previousState; 
-     }
+     currentFrameIndex = 0;
+     Serial.println("Animation gestartet!");
+     dma_display->fillScreen(0);
   }
 
   // Aktuellen Wert als "Vorherigen" für das nächste Mal speichern
@@ -538,6 +442,79 @@ void zeichneAkku()
   // Dann den gefüllten Teil darüber zeichnen
   dma_display->fillRect(innen_x, y_start_fuellung, innen_breite, aktuelleFuellHoehe, fuellFarbe);
 }
+void zeichneAkku2()
+{
+  dma_display->setFont(NULL); // Reset font to default for drawing rects
+  int gesamtBreite = PANEL_WIDTH * PANELS_CHAINED; // 192
+  int hoehe = 64; 
+  
+  // Farben
+  uint16_t weiss = dma_display->color565(255, 255, 255);
+  uint16_t schwarz = dma_display->color565(0, 0, 0);
+
+  // Sicherheit: Wert begrenzen (0-100)
+  float soc = g_batt_soc;
+  if (soc < 0) soc = 0; // Falls Sensorfehler (-1), zeige leer
+  if (soc > 100) soc = 100;
+
+  // 1. Rahmen zeichnen (über volle Breite)
+  dma_display->drawRect(0, 0, gesamtBreite, hoehe, weiss);
+
+  // 2. Füllung berechnen
+  int maxFuellBreite = gesamtBreite - 2; 
+  int aktuelleBreite = (int)((soc / 100.0) * maxFuellBreite);
+
+  // 3. Den "vollen" Teil weiß ausmalen
+  if (aktuelleBreite > 0) {
+    dma_display->fillRect(1, 1, aktuelleBreite, hoehe - 2, weiss);
+  }
+
+  // 4. Den "leeren" Teil schwarz ausmalen
+  int restBreite = maxFuellBreite - aktuelleBreite;
+  if (restBreite > 0) {
+    dma_display->fillRect(1 + aktuelleBreite, 1, restBreite, hoehe - 2, schwarz);
+  }
+
+  // 5. NEU: 5 vertikale schwarze Balken als visuelle Hilfe
+  // Wir unterteilen 192 Pixel in 6 Bereiche -> 192 / 6 = 32 Pixel Abstand
+  // Linien bei 32, 64, 96, 128, 160
+  for (int i = 1; i < 6; i++) {
+     int xLine = (gesamtBreite / 6) * i;
+     // Wir zeichnen eine 2px breite schwarze Linie über die ganze Höhe
+     dma_display->fillRect(xLine, 1, 2, hoehe - 2, schwarz);
+  }
+
+  // 6. Textfarbe basierend auf Akku-Stand
+  uint16_t textFarbe;
+  if (soc > 60.0) {
+    textFarbe = dma_display->color565(0, 150, 0); // Dunkelgrün
+  } else if (soc > 20.0) {
+    textFarbe = dma_display->color565(200, 180, 0); // Gold
+  } else {
+    textFarbe = dma_display->color565(255, 0, 0); // Rot
+  }
+
+  // 7. NEU: Großer Text zentriert
+  // Font umschalten
+  dma_display->setFont(&FreeMonoBold24pt7b);
+  dma_display->setTextSize(1);
+  dma_display->setTextColor(textFarbe);
+
+  String prozentText = String((int)soc) + "%";
+  
+  // Text Bounds berechnen für echtes Zentrieren
+  int16_t x1, y1;
+  uint16_t w, h;
+  dma_display->getTextBounds(prozentText, 0, 0, &x1, &y1, &w, &h);
+
+  int textX = (gesamtBreite - w) / 2;
+  // Vertikal: Die Höhe 'h' ist die Box-Höhe. 
+  // Um visuell mittig zu sein: (DisplayHöhe + TextHöhe) / 2 - baselinien offset
+  int textY = (hoehe + h) / 2 - 6; 
+
+  dma_display->setCursor(textX, textY);
+  dma_display->print(prozentText);
+}
 // Zoahir
 
 /**
@@ -640,6 +617,20 @@ void zeichneWetter(int x, int y)
 }
 // Zohair
 
+// Helper to determine next state in the cycle
+DisplayState getNextState(DisplayState current) {
+    switch(current) {
+        case STATE_MAIN: return STATE_LOGO;
+        case STATE_LOGO: return STATE_FULLSCREEN;
+        case STATE_FULLSCREEN: return STATE_AKKU2;
+        case STATE_AKKU2: return STATE_TIME_LARGE;
+        case STATE_TIME_LARGE: return STATE_TEMP_LARGE;
+        case STATE_TEMP_LARGE: return STATE_POWER_LARGE;
+        case STATE_POWER_LARGE: return STATE_MAIN;
+        default: return STATE_MAIN;
+    }
+}
+
 /**
  * @brief Zeichnet die aktuellen Daten auf das Display
  */
@@ -667,7 +658,39 @@ void updateDisplay()
 
     case STATE_FULLSCREEN:
       if (jetzt - stateTimer >= DURATION_FULLSCREEN) {
-        currentState = STATE_MAIN;
+        currentState = STATE_AKKU2; // Transition to Akku2
+        stateTimer = jetzt;
+        dma_display->fillScreen(0);
+      }
+      break;
+
+    case STATE_AKKU2:
+      if (jetzt - stateTimer >= DURATION_AKKU2) {
+        currentState = STATE_TIME_LARGE;
+        stateTimer = jetzt;
+        dma_display->fillScreen(0);
+      }
+      break;
+
+    case STATE_TIME_LARGE:
+      if (jetzt - stateTimer >= DURATION_TIME_LARGE) {
+        currentState = STATE_TEMP_LARGE;
+        stateTimer = jetzt;
+        dma_display->fillScreen(0);
+      }
+      break;
+
+    case STATE_TEMP_LARGE:
+      if (jetzt - stateTimer >= DURATION_TEMP_LARGE) {
+        currentState = STATE_POWER_LARGE;
+        stateTimer = jetzt;
+        dma_display->fillScreen(0);
+      }
+      break;
+
+    case STATE_POWER_LARGE:
+      if (jetzt - stateTimer >= DURATION_POWER_LARGE) {
+        currentState = STATE_MAIN; // Back to start
         stateTimer = jetzt;
         dma_display->fillScreen(0);
       }
@@ -678,6 +701,7 @@ void updateDisplay()
   switch (currentState) {
     case STATE_MAIN:
       // Linkes Panel (Grafiken) löschen
+      dma_display->setFont(NULL); // Sicherstellen, dass Standard-Font genutzt wird
       dma_display->fillRect(0, 0, 64, 64, 0);
 
       // Zohair
@@ -746,23 +770,38 @@ void updateDisplay()
       break;
 
     case STATE_CHARGING_ANIMATION:
-      // GIF Frame abspielen
-      if (gif.playFrame(true, NULL)) // true = wait if needed (delay handling)
-      {
-         // Frame wurde gezeichnet.
-      }
-      else
-      {
-         // GIF ist am Ende (oder Loop zu Ende)
-         // Wir setzen es zurück für den nächsten Loop (falls wir loopen wollen) oder beenden es.
-         gif.reset(); 
+      // Animation abspielen (einfach Frames durchwechseln)
+      if (jetzt - lastFrameTime >= FRAME_DELAY) {
+        lastFrameTime = jetzt;
+        
+        unsigned long startDraw = micros();
+        
+        // Entscheide Quelle: PSRAM oder Flash
+        if (psramInitialized) {
+             dma_display->drawRGBBitmap(0, 0, frames_psram[currentFrameIndex], FRAME_WIDTH, FRAME_HEIGHT);
+        } else {
+             dma_display->drawRGBBitmap(0, 0, animation_frames[currentFrameIndex], FRAME_WIDTH, FRAME_HEIGHT);
+        }
+        
+        unsigned long duration = micros() - startDraw;
+        Serial.printf("Frame %d Draw Time: %lu us\n", currentFrameIndex, duration); // Debug
+
+        currentFrameIndex++;
+        if (currentFrameIndex >= FRAME_COUNT) {
+          currentFrameIndex = 0; // Loop
+        }
       }
 
       // Prüfen ob Zeit abgelaufen ist
       if (jetzt - stateTimer >= DURATION_CHARGING) {
-        gif.close(); // Wichtig: Datei schließen
-        currentState = previousState; // Zurück zum alten State
+        currentState = getNextState(previousState); // Weiter zum NÄCHSTEN State
+        currentDisplayInterval = 500; // TURBO-MODUS AUS (500ms)
         stateTimer = jetzt;
+
+        // Reset Timers to prevent black screen / blocking
+        lastDisplayUpdate = 0;              // Force immediate update
+        lastMqttReconnectAttempt = jetzt;   // Delay MQTT check by 5s
+        
         dma_display->fillScreen(0);
       }
       break;
@@ -782,6 +821,95 @@ void updateDisplay()
       dma_display->setTextSize(1);
       dma_display->setTextColor(dma_display->color565(167, 165, 232)); //lavendel
       dma_display->print("100 Handyladungen ");
+      break;
+
+    case STATE_AKKU2:
+      zeichneAkku2();
+      break;
+
+    case STATE_TIME_LARGE:
+      {
+        dma_display->setFont(&FreeMonoBold24pt7b);
+        dma_display->setTextColor(dma_display->color565(255, 255, 255));
+        dma_display->setTextSize(1);
+
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            char timeString[6];
+            strftime(timeString, sizeof(timeString), "%H:%M", &timeinfo);
+            
+            int16_t x1, y1;
+            uint16_t w, h;
+            dma_display->getTextBounds(timeString, 0, 0, &x1, &y1, &w, &h);
+            int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
+            int y = (PANEL_HEIGHT + h) / 2; 
+            dma_display->setCursor(x, y - 6);  
+            dma_display->print(timeString);
+        } else {
+             dma_display->setFont(NULL);
+             dma_display->setCursor(0, 0);
+             dma_display->print("Wait for Time...");
+        }
+      }
+      break;
+
+    case STATE_TEMP_LARGE:
+      {
+        dma_display->setFont(&FreeMonoBold24pt7b);
+        dma_display->setTextColor(dma_display->color565(255, 255, 255));
+        dma_display->setTextSize(1);
+        
+        String tempVal = String((int)round(g_temperatur));
+        // Wir zeichnen "25", dann einen Kreis, dann "C"
+        
+        int16_t x1, y1;
+        uint16_t wNum, hNum;
+        dma_display->getTextBounds(tempVal, 0, 0, &x1, &y1, &wNum, &hNum);
+        
+        uint16_t wC, hC;
+        dma_display->getTextBounds("C", 0, 0, &x1, &y1, &wC, &hC);
+        
+        int gap = 15; // Platz für den Kreis
+        int totalW = wNum + gap + wC;
+        
+        int xStart = (PANEL_WIDTH * PANELS_CHAINED - totalW) / 2;
+        int yStart = (PANEL_HEIGHT + hNum) / 2;
+        
+        // 1. Zahl
+        dma_display->setCursor(xStart, yStart - 6);
+        dma_display->print(tempVal);
+        
+        // 2. Kreis (manuell)
+        int r = 3;
+        int xCircle = xStart + wNum + 12; 
+        int yCircle = yStart - 6 - 20; // Etwas höher als die Mitte
+        
+        uint16_t c = dma_display->color565(255, 255, 255);
+        dma_display->drawCircle(xCircle, yCircle, r, c);
+        dma_display->drawCircle(xCircle, yCircle, r-1, c); // Etwas dicker
+        
+        // 3. "C"
+        dma_display->setCursor(xStart + wNum + gap, yStart - 6);
+        dma_display->print("C");
+      }
+      break;
+
+    case STATE_POWER_LARGE:
+      {
+         dma_display->setFont(&FreeMonoBold24pt7b);
+         dma_display->setTextColor(dma_display->color565(255, 255, 255));
+         dma_display->setTextSize(1);
+
+         String pwrStr = String((int)round(g_batt_power)) + "W";
+
+         int16_t x1, y1;
+         uint16_t w, h;
+         dma_display->getTextBounds(pwrStr, 0, 0, &x1, &y1, &w, &h);
+         int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
+         int y = (PANEL_HEIGHT + h) / 2;
+         dma_display->setCursor(x, y - 6);
+         dma_display->print(pwrStr);
+      }
       break;
   }
 }
@@ -846,27 +974,53 @@ void setup()
   // Wetter sofort beim Start holen
   holeWetter();
 
+  // I2C Manuell auf freien Pins starten, damit es nicht mit der Matrix kollidiert (GPIO 8/9)
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
   // INA219 Initialisierung
   if (!ina219.begin()) {
-    Serial.println("Fehler: INA219 Chip nicht gefunden!");
+    Serial.println("Fehler: INA219 Chip nicht gefunden! (Deaktiviere Current-Checks)");
+    ina219_active = false;
   } else {
     Serial.println("INA219 Chip gefunden.");
+    ina219_active = true;
+    
     // Optional: Kalibrierung für höhere Stromstärken, falls nötig
-    // ina219.setCalibration_32V_2A(); // Oder _32V_1A(), je nach Shunt
-    // Standard ist 32V_2A, was bis 3.2A misst. Für mehr Range Doku prüfen.
+    //ina219.setCalibration_32V_2A(); // Oder _32V_1A(), je nach Shunt
+    
     // Wir lesen hier erstmal den ersten Wert, damit der "Sprung" nicht beim Boot passiert
     current_mA_prev = ina219.getCurrent_mA();
   }
 
-  // LittleFS starten
-  if (!LittleFS.begin()) {
-    Serial.println("LittleFS konnte nicht gestartet werden. Formatiere...");
-    LittleFS.format();
-    LittleFS.begin();
+  // LittleFS starten - optional, aber gut
+  // --- PSRAM Caching für Animation ---
+  if (psramFound()) {
+    Serial.println("PSRAM gefunden! Kopiere Frames...");
+    size_t frameSize = FRAME_WIDTH * FRAME_HEIGHT * sizeof(uint16_t);
+    bool success = true;
+    for (int i = 0; i < FRAME_COUNT; i++) {
+        // Reserviere Speicher im PSRAM
+        frames_psram[i] = (uint16_t*) ps_malloc(frameSize);
+        if (frames_psram[i] == NULL) {
+            Serial.printf("Fehler: Kein PSRAM mehr für Frame %d!\n", i);
+            success = false;
+            break;
+        }
+        // Kopiere vom Flash (animation_frames[i]) in den PSRAM (frames_psram[i])
+        // memcpy_P kopiert aus dem Programmspeicher
+        memcpy_P(frames_psram[i], animation_frames[i], frameSize);
+    }
+    if (success) {
+        Serial.println("Alle Frames erfolgreich in PSRAM geladen!");
+        psramInitialized = true;
+    }
+  } else {
+    Serial.println("Warnung: Kein PSRAM gefunden. Animation läuft langsam vom Flash.");
   }
+
+  // LittleFS entfernt (nicht mehr benötigt für PROGMEM Animation)
   
-  // GIF vor-initialisieren (Buffer)
-  gif.begin(LITTLE_ENDIAN_PIXELS); // Unsere Palette ist schon Little Endian durch color565 logic (meistens)
+  // GIF Init entfernt
 
   // Zohair
 
@@ -905,16 +1059,16 @@ void setup()
 void loop()
 {
   // 1. MQTT-Verbindung prüfen und ggf. wiederherstellen (Non-blocking)
-  if (!client.connected())
+  // WICHTIG: Nicht während der Animation versuchen zu verbinden, da das blockieren kann!
+  if (currentState != STATE_CHARGING_ANIMATION && !client.connected())
   {
     unsigned long now = millis();
-    if (now - lastMqttReconnectAttempt > 1000)
+    // Alle 5 Sekunden versuchen
+    if (now - lastMqttReconnectAttempt > 5000)
     {
       lastMqttReconnectAttempt = now;
       Serial.print("Versuche MQTT-Verbindung...");
       // Client-ID kann beliebig sein.
-      // Doku sagt "allow_anonymous true",
-      // daher kein User/Pass nötig.
       if (client.connect("esp32MatrixClient"))
       {
         Serial.println("verbunden!");
@@ -928,7 +1082,6 @@ void loop()
         Serial.print("fehlgeschlagen, rc=");
         Serial.print(client.state());
         Serial.println(" Erneuter Versuch in 5 Sek.");
-        //dma_display->print("FAIL");
       }
     }
   }
@@ -971,7 +1124,7 @@ void loop()
 
   // 3. Display nur alle X Millisekunden aktualisieren (verhindert Flimmern)
   unsigned long currentMillis = millis();
-  if (currentMillis - lastDisplayUpdate >= displayUpdateInterval)
+  if (currentMillis - lastDisplayUpdate >= currentDisplayInterval)
   {
     lastDisplayUpdate = currentMillis;
 
