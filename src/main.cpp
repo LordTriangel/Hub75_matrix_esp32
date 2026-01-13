@@ -3,15 +3,20 @@
 #include <PubSubClient.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Adafruit_GFX.h>
-#include <Fonts/FreeMonoBold24pt7b.h>
+// Font header removed (now in renderer)
 #include <time.h>
-#include "bitmap.h"      // Unsere neue Header-Datei für die Bitmap
-#include <HTTPClient.h>  // NEU: Für den Wetter-Abruf
-#include <ArduinoJson.h> // NEU: Zum Verstehen der Wetter-Daten
+#include "bitmap.h"      
+#include <HTTPClient.h>  
+#include <ArduinoJson.h> 
 #include <Wire.h>
 #include <Adafruit_INA219.h>
-#include "frames.h"      // NEU: Unsere Bitmap Frames
-#include "secrets.h"     // Credentials
+#include "frames.h"      
+#include "qrcode_bitmap.h" 
+#include "secrets.h"     
+#include "system_state.h"     // [REF] New
+#include "display_renderer.h" // [REF] New
+
+
 
 // I2C Pins für INA219
 // Matrix nutzt: 3,4,5,6,7,8,9,10,11,15,16,18,40,41
@@ -69,43 +74,14 @@ const int daylightOffset_sec = 3600; // Sommerzeit = +1 weitere Stunde
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// Globale Variablen zum Speichern der Livedaten
-// (Mit -1 initialisiert, um "keine Daten" zu erkennen)
-float g_batt_voltage = -1.0;
-float g_batt_current = -1.0;
-float g_batt_soc = -1.0;
-float g_pv1_voltage = -1.0;
-float g_pv2_voltage = -1.0;
-float g_batt_power = -1.0;
-
-// Wetterdaten (Startwert -99 bedeutet: noch keine Daten)
-float g_temperatur = -99.0;
-
-// INA219 Sensor
-Adafruit_INA219 ina219;
-int w_chg_cnt = 0;              // Anzahl der ladenden Geräte (Wireless Charging)
-float current_mA_prev = 0;      // Vorheriger Stromwert für Sprungerkennung
-unsigned long lastInaUpdate = 0;// Timer für INA Check
-
-// GIF Globals entfernt
-// const char *gifFilename = "/warp_chg_192x64.gif";
-
-//  Timer für Display-Aktualisierung
-unsigned long lastDisplayUpdate = 0;
-unsigned long currentDisplayInterval = 400; // Standard: 500ms. Wird bei Animation auf 20ms verkürzt.
+// Globals moved to SystemState
+DisplayRenderer* renderer = nullptr;
 
 // Zohair
-// Globale Variablen für die Sonnen-Animation
+//   NTP (Uhrzeit) Einstellungen
+// ... (ntpServer etc remains, but variables moved) -> wait, constants remain.
+// Just remove the `float g_...` variables.
 
-unsigned long letzteSonneAnimation = 0;   // Speichert den Zeitpunkt der letzten Animationsänderung
-const long sonneAnimationIntervall = 100; // 2000ms = 2 Sekunden //legt fest, wie lange wir warten bis näcshte stufe
-int sonnenStrahlStatus = 0;               // 0 = keine Strahlen, 1-3 = wachsende Strahlen
-const int MAX_STRAHL_STATUS = 3;          // Wir wollen 3 Wachstums-Stufen
-// wetter
-unsigned long letztesWetterUpdate = 0;
-const long wetterUpdateInterval = 900000; // 15 Minuten (in Millisekunden)
-
-// ENDE Zohair
 
 // Timer für MQTT Reconnect (Non-blocking)
 unsigned long lastMqttReconnectAttempt = 0;
@@ -172,9 +148,9 @@ void holeWetter()
       if (!error)
       {
         float temp = doc["main"]["temp"]; // Temperatur auslesen
-        g_temperatur = temp;              // Temperatur speichern
+        sysState.temperature = temp;      // Temperatur speichern
         Serial.print("Neues Wetter: ");
-        Serial.println(g_temperatur);
+        Serial.println(sysState.temperature);
       }
       else
       {
@@ -202,68 +178,124 @@ bool psramInitialized = false;
 
 // FUNKTION: Wireless Charging Check (INA219)
 // ------------------------------------------------------
+// FUNKTION: Wireless Charging Check (INA219)
+// ------------------------------------------------------
 void checkWirelessChargingCurrent() {
-  // Wenn kein Sensor da ist, brechen wir hier ab (verhindert I2C-Fehler/Verzögerung)
-  if (!ina219_active) {
-      // fehlerbehandlung
+  if (!ina219_active) return;
+
+  // Configuration
+  const float NOISE_THRESHOLD = 50.0;       // mA: Below this, we update baseline immediately
+  const float ANIMATION_THRESHOLD = 150.0;  // mA: Fast feedback trigger
+  const float DEVICE_THRESHOLD = 400.0;     // mA: Real device detection (0.5A is min usually)
+  const unsigned long STABILIZE_TIMEOUT = 5000; // ms: If value "hangs" in between for 5s, accept it
+  
+  static float baseline_mA = -1.0; 
+  static unsigned long lastStabilityCheck = 0;
+  static bool animationTriggeredForThisEvent = false;
+  static unsigned long lastEventTime = 0;
+
+  float current_mA = ina219.getCurrent_mA();
+  
+  // Initialize Baseline
+  if (baseline_mA < 0) {
+      baseline_mA = current_mA;
+      lastStabilityCheck = millis();
+      return; 
   }
 
-  // Aktuellen Strom in mA lesen
-  float current_mA = 0;
-  if (ina219_active) {
-      current_mA = ina219.getCurrent_mA();
+  float diff = current_mA - baseline_mA;
+  unsigned long now = millis();
+
+  /*
+   * LOGIC:
+   * 1. Interactive Trigger: High enough jump to look like a start -> Animation
+   * 2. Device Count: High enough jump/drop to be a device -> Update Count
+   * 3. Baseline Tracking: 
+   *    - Small noise? Follow immediately.
+   *    - Medium change? Hold baseline to see if it's a ramp.
+   *    - Timeout? If it stays medium for too long, just accept it (drift/throttling).
+   */
+
+  // --- 1. Interactive Animation Trigger ---
+  // If we see a sharp rise, give instant feedback
+  // Only if we haven't just triggered (bounce protection) AND we are not in the cooldown of an event
+  if (diff > ANIMATION_THRESHOLD && !animationTriggeredForThisEvent && (now - lastEventTime > 2000)) {
+       // Only trigger visual if not already running
+       if (currentState != STATE_CHARGING_ANIMATION) {
+          previousState = currentState; 
+          currentState = STATE_CHARGING_ANIMATION;
+          currentDisplayInterval = 20; // Turbo
+          stateTimer = millis();
+          currentFrameIndex = 0;
+          dma_display->fillScreen(0);
+          Serial.println("INTERACTIVE: Animation triggered by current jump!");
+       }
+       animationTriggeredForThisEvent = true; 
+  }
+
+  // --- 2. Device Detection (The "Smart" Part) ---
+  if (abs(diff) >= DEVICE_THRESHOLD) {
+      // It's a BIG change!
+      
+      // Debounce: Ensure 5 seconds between "Add" events as requested?
+      // User said: "within 5 seconds no two devices start".
+      // We can just trust the threshold crossing.
+      
+      if (diff > 0) {
+          // ADD DEVICE
+           // Prevent double counting if rapid fluctuations? 
+           // Usually acceptable to count up.
+           if (now - lastEventTime > 2000) { // minimal debounce
+              sysState.w_chg_cnt++;
+              if (sysState.w_chg_cnt > 2) sysState.w_chg_cnt = 2;
+              Serial.printf("DETECT: Device ADDED! Count: %d (Diff: %.1f)\n", sysState.w_chg_cnt, diff);
+              
+              baseline_mA = current_mA; 
+              lastEventTime = now;
+              animationTriggeredForThisEvent = false; // Reset for next ones
+           }
+      } else {
+          // REMOVE DEVICE
+          if (now - lastEventTime > 1000) {
+              sysState.w_chg_cnt--;
+              if (sysState.w_chg_cnt < 0) sysState.w_chg_cnt = 0;
+              Serial.printf("DETECT: Device REMOVED! Count: %d (Diff: %.1f)\n", sysState.w_chg_cnt, diff);
+              
+              baseline_mA = current_mA; 
+              lastEventTime = now;
+              animationTriggeredForThisEvent = false; 
+          }
+      }
+      lastStabilityCheck = now; // Reset timeouts
+  } 
+  else {
+      // --- 3. Baseline Handling (Small/Medium changes) ---
+      
+      if (abs(diff) < NOISE_THRESHOLD) {
+          // It's just noise/drift. Update baseline gently or directly.
+          // Direct update matches "it's stable".
+          baseline_mA = current_mA;
+          lastStabilityCheck = now; // It is stable
+          
+          if (abs(diff) < 20.0) {
+             animationTriggeredForThisEvent = false; // Reset trigger if very stable (returned to 0 diff)
+          }
+      } 
+      else {
+          // It is in the "Medium" zone (between 50 and 400mA).
+          // This could be a "Ramp in progress" OR "Throttling/Drift".
+          // We HOLD the baseline and wait.
+          
+          if (now - lastStabilityCheck > STABILIZE_TIMEOUT) {
+              // We've been hanging here for 5 seconds. It's not a ramp. It's a new steady state.
+              Serial.printf("STABLE: Adapting to drift/throttling. New Baseline: %.1f\n", current_mA);
+              baseline_mA = current_mA;
+              lastStabilityCheck = now;
+          }
+      }
   }
   
-  // Differenz zum letzten Wert
-  float diff = current_mA - current_mA_prev;
-
-  // --- DEBUG TRIGGER (da kein Sensor vorhanden) ---
-  // Simuliere alle 30 Sekunden einen "Auflege-Vorgang"
-  static unsigned long lastDebugTrigger = 0;
-  if (millis() - lastDebugTrigger > 30000) {
-     diff = 2000.0; // Künstlicher Sprung von +2A
-     lastDebugTrigger = millis();
-     Serial.println("DEBUG: Künstlicher Ladestart ausgelöst!");
-  }
-  // ----------------------------------------------
-
-  bool triggerAnimation = false;
-
-  // Debug Ausgabe
-  // Serial.print("Strom: "); Serial.print(current_mA); Serial.print(" mA | Diff: "); Serial.println(diff);
-
-  // Schwelle für "Sprung" festlegen (1 Ampere = 1000mA)
-  // Positive Flanke (Gerät aufgelegt)
-  if (diff >= 1000.0) {
-    w_chg_cnt++;
-    Serial.print("Sprung nach OBEN erkannt! Neuer Count: ");
-    Serial.println(w_chg_cnt);
-    triggerAnimation = true;
-  }
-  // Negative Flanke (Gerät weggenommen)
-  // Wir prüfen auf <= -1000, damit auch ein Abfall erkannt wird
-  else if (diff <= -1000.0) {
-    w_chg_cnt--;
-    if (w_chg_cnt < 0) w_chg_cnt = 0; // Nicht unter 0 gehen
-    Serial.print("Sprung nach UNTEN erkannt! Neuer Count: ");
-    Serial.println(w_chg_cnt);
-    triggerAnimation = true; // Auch beim Wegnehmen Animation zeigen? (Optional)
-    // Wenn NUR beim Auflegen: if (diff >= 1000.0) triggerAnimation = true; else triggerAnimation = false;
-  }
-
-  // Animation starten, wenn was passiert ist UND wir nicht schon animieren
-  if (triggerAnimation && currentState != STATE_CHARGING_ANIMATION) {
-     previousState = currentState; // Merken wo wir waren
-     currentState = STATE_CHARGING_ANIMATION;
-     currentDisplayInterval = 20; // TURBO-MODUS AN (20ms)
-     stateTimer = millis();
-     currentFrameIndex = 0;
-     Serial.println("Animation gestartet!");
-     dma_display->fillScreen(0);
-  }
-
-  // Aktuellen Wert als "Vorherigen" für das nächste Mal speichern
-  current_mA_prev = current_mA;
+  current_mA_prev = current_mA; // Keep for legacy or debug
 }
 
 /**
@@ -272,39 +304,54 @@ void checkWirelessChargingCurrent() {
  */
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
-  // Payload in einen String umwandeln
-  String message;
-  for (int i = 0; i < length; i++)
-  {
-    message += (char)payload[i];
-  }
-  float value = message.toFloat();
+  // Payload in einen C-String umwandeln (Performance & Speicher Optimierung)
+  char messageBuffer[32]; 
+  // Sicherstellen, dass wir nicht überlaufen
+  unsigned int copyLen = (length < sizeof(messageBuffer) - 1) ? length : (sizeof(messageBuffer) - 1);
+  memcpy(messageBuffer, payload, copyLen);
+  messageBuffer[copyLen] = '\0'; // Null-Terminierung
+  
+  // Konvertierung
+  float value = atof(messageBuffer);
 
   // Daten
   if (strcmp(topic, "Saftkiste/battery_voltage") == 0)
   {
-    g_batt_voltage = value;
+    sysState.batt_voltage = value;
   }
   else if (strcmp(topic, "Saftkiste/battery_current") == 0)
   {
-    g_batt_current = value;
+    sysState.batt_current = value;
   }
-  else if (strcmp(topic, "Saftkiste/battery_power") == 0)
+  else if (strcmp(topic, "Saftkiste/netto_battery_power_W") == 0)
   {
-    g_batt_power = value;
+    sysState.batt_power = value;
   }
-  else if (strcmp(topic, "Saftkiste/battery_state_of_charge") == 0)
+  else if (strcmp(topic, "Saftkiste/State_Of_Charge") == 0)
   {
-    g_batt_soc = value;
+    sysState.batt_soc = value;
   }
   else if (strcmp(topic, "chargeController/1/voltage") == 0)
   {
-    g_pv1_voltage = value;
+    sysState.pv1_voltage = value;
   }
   else if (strcmp(topic, "chargeController/2/voltage") == 0)
   {
-    g_pv2_voltage = value;
+    sysState.pv2_voltage = value;
   }
+  else if (strcmp(topic, "Anlagendaten/PV_Ladeleistung_W") == 0)
+  {
+    sysState.pv_power = value;
+  }
+  else if (strcmp(topic, "Anlagendaten/Verbrauchsleistung_W") == 0)
+  {
+    sysState.verbrauchsleistung = value;
+  }
+  else if (strcmp(topic, "Anlagendaten/Einspeisung_Heute_Wh") == 0)
+  {
+    sysState.einspeisung_heute_Wh = value;
+  }
+
   // (Weitere Topics wie .../current können hier hinzugefügt werden)
 }
 
@@ -361,261 +408,8 @@ void setup_wifi()
   }
 }
 
-// Zoahir
-/**
- * @brief Zeichnet ein Akku-Symbol oben rechts auf das Display.
- * Der Füllstand und die Farbe basieren auf g_batt_soc.
- */
-void zeichneAkku()
-{
-  g_batt_soc=100.0;
+// Drawing logic moved to DisplayRenderer
 
-  // 1. Definiere Farben
-  uint16_t weiss = dma_display->color565(255, 255, 255);
-  uint16_t rot = dma_display->color565(255, 0, 0);
-  uint16_t gelb = dma_display->color565(255, 255, 0);
-  uint16_t gruen = dma_display->color565(0, 255, 0);
-  uint16_t schwarz = 0; // 0 ist immer schwarz
-
-  // 2. Definiere Position und Größe des Akkus
-  // (0,0) ist oben links, (63, 63) ist unten rechts
-  int batt_breite = 10; // Breite des Akku-Körpers
-  int batt_hoehe = 18;  // Höhe des Akku-Körpers
-  int batt_x = 51;      // X-Position (oben rechts)
-  int batt_y = 4;       // Y-Position (oben)
-
-  // 3. Bestimme Füllfarbe basierend auf g_batt_soc (0.0 - 100.0)
-  uint16_t fuellFarbe;
-  if (g_batt_soc <= 20.0)
-  {
-    fuellFarbe = rot;
-  }
-  else if (g_batt_soc <= 60.0)
-  {
-    fuellFarbe = gelb;
-  }
-  else
-  {
-    fuellFarbe = gruen;
-  }
-
-  // Wenn g_batt_soc noch -1 ist (keine Daten empfangen),
-  // zeichne nur den leeren Akku
-  if (g_batt_soc < 0.0)
-  {
-    fuellFarbe = schwarz; // Innen leer
-  }
-
-  // 4. Zeichne das weiße Gehäuse
-  // Der "Pluspol" oben (ein gefülltes Rechteck)
-  dma_display->fillRect(batt_x + 3, batt_y - 2, 4, 2, weiss);
-  // Der Akku-Körper (nur der Umriss)
-  dma_display->drawRect(batt_x, batt_y, batt_breite, batt_hoehe, weiss);
-
-  // 5. Zeichne die Füllung
-  // Die Füllung ist 1 Pixel kleiner als das Gehäuse (innen)
-  int innen_x = batt_x + 1;
-  int innen_y = batt_y + 1;
-  int innen_breite = batt_breite - 2;
-  int maxInnenHoehe = batt_hoehe - 2; // Die Höhe bei 100%
-
-  // Berechne die aktuelle Füllhöhe (von 0 bis maxInnenHoehe)
-  int aktuelleFuellHoehe = (g_batt_soc / 100.0) * maxInnenHoehe;
-
-  // Stelle sicher, dass die Höhe nicht über das Maximum geht
-  if (aktuelleFuellHoehe > maxInnenHoehe)
-  {
-    aktuelleFuellHoehe = maxInnenHoehe;
-  }
-  if (aktuelleFuellHoehe < 0)
-  {
-    aktuelleFuellHoehe = 0;
-  }
-
-  // Berechne den Y-Startpunkt für das Füllen von UNTEN nach OBEN
-  // (Ein fillRect fängt immer oben an zu zeichnen)
-  int y_start_fuellung = innen_y + (maxInnenHoehe - aktuelleFuellHoehe);
-
-  // Zuerst den leeren (schwarzen) Teil zeichnen
-  dma_display->fillRect(innen_x, innen_y, innen_breite, maxInnenHoehe - aktuelleFuellHoehe, schwarz);
-
-  // Dann den gefüllten Teil darüber zeichnen
-  dma_display->fillRect(innen_x, y_start_fuellung, innen_breite, aktuelleFuellHoehe, fuellFarbe);
-}
-void zeichneAkku2()
-{
-  dma_display->setFont(NULL); // Reset font to default for drawing rects
-  int gesamtBreite = PANEL_WIDTH * PANELS_CHAINED; // 192
-  int hoehe = 64; 
-  
-  // Farben
-  uint16_t weiss = dma_display->color565(255, 255, 255);
-  uint16_t schwarz = dma_display->color565(0, 0, 0);
-
-  // Sicherheit: Wert begrenzen (0-100)
-  float soc = g_batt_soc;
-  if (soc < 0) soc = 0; // Falls Sensorfehler (-1), zeige leer
-  if (soc > 100) soc = 100;
-
-  // 1. Rahmen zeichnen (über volle Breite)
-  dma_display->drawRect(0, 0, gesamtBreite, hoehe, weiss);
-
-  // 2. Füllung berechnen
-  int maxFuellBreite = gesamtBreite - 2; 
-  int aktuelleBreite = (int)((soc / 100.0) * maxFuellBreite);
-
-  // 3. Den "vollen" Teil weiß ausmalen
-  if (aktuelleBreite > 0) {
-    dma_display->fillRect(1, 1, aktuelleBreite, hoehe - 2, weiss);
-  }
-
-  // 4. Den "leeren" Teil schwarz ausmalen
-  int restBreite = maxFuellBreite - aktuelleBreite;
-  if (restBreite > 0) {
-    dma_display->fillRect(1 + aktuelleBreite, 1, restBreite, hoehe - 2, schwarz);
-  }
-
-  // 5. NEU: 5 vertikale schwarze Balken als visuelle Hilfe
-  // Wir unterteilen 192 Pixel in 6 Bereiche -> 192 / 6 = 32 Pixel Abstand
-  // Linien bei 32, 64, 96, 128, 160
-  for (int i = 1; i < 6; i++) {
-     int xLine = (gesamtBreite / 6) * i;
-     // Wir zeichnen eine 2px breite schwarze Linie über die ganze Höhe
-     dma_display->fillRect(xLine, 1, 2, hoehe - 2, schwarz);
-  }
-
-  // 6. Textfarbe basierend auf Akku-Stand
-  uint16_t textFarbe;
-  if (soc > 60.0) {
-    textFarbe = dma_display->color565(0, 150, 0); // Dunkelgrün
-  } else if (soc > 20.0) {
-    textFarbe = dma_display->color565(200, 180, 0); // Gold
-  } else {
-    textFarbe = dma_display->color565(255, 0, 0); // Rot
-  }
-
-  // 7. NEU: Großer Text zentriert
-  // Font umschalten
-  dma_display->setFont(&FreeMonoBold24pt7b);
-  dma_display->setTextSize(1);
-  dma_display->setTextColor(textFarbe);
-
-  String prozentText = String((int)soc) + "%";
-  
-  // Text Bounds berechnen für echtes Zentrieren
-  int16_t x1, y1;
-  uint16_t w, h;
-  dma_display->getTextBounds(prozentText, 0, 0, &x1, &y1, &w, &h);
-
-  int textX = (gesamtBreite - w) / 2;
-  // Vertikal: Die Höhe 'h' ist die Box-Höhe. 
-  // Um visuell mittig zu sein: (DisplayHöhe + TextHöhe) / 2 - baselinien offset
-  int textY = (hoehe + h) / 2 - 6; 
-
-  dma_display->setCursor(textX, textY);
-  dma_display->print(prozentText);
-}
-// Zoahir
-
-/**
- * @brief Zeichnet die Uhrzeit
- */
-void zeichneUhrzeit()
-{
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo))
-  {
-    // Zeit ist noch nicht synchronisiert
-    dma_display->setCursor(5, 40);
-    dma_display->setTextSize(1);
-    dma_display->setTextColor(dma_display->color565(255, 0, 0)); // Rot
-    dma_display->print("Zeit...");
-    return;
-  }
-
-  // Zeit in einen String formatieren (z.B. "14:35")
-  char timeString[6]; // HH:MM + Null-Terminierer
-  strftime(timeString, sizeof(timeString), "%H:%M", &timeinfo);
-
-  // Text-Eigenschaften
-  dma_display->setTextSize(2);                                     // "emnisschen größer"
-  dma_display->setTextColor(dma_display->color565(255, 255, 255)); // Weiß
-  
-  // Position "mitte (x) und embisschen unten (y)"
-  // TextSize 2 ist 10px breit pro Zeichen (5*2). "14:35" = 5 Zeichen = 50px
-  // Mitte X = (64 - 50) / 2 = 7
-  int x_pos = 4;
-  int y_pos = 45; // "embisschen unten"
-
-  dma_display->setCursor(x_pos, y_pos);
-  dma_display->print(timeString);
-}
-
-// Zohair
-/**
- * @brief Zeichnet die Sonne und ihre Strahlen
- * @param strahlStatus 0 = keine Strahlen, 1-3 = wachsende Strahlen
- */
-void zeichneSonne(int strahlStatus)
-{
-
-  // Die Mitte ist jetzt OBEN LINKS
-  int centerX = 20; // Vorher 32
-  int centerY = 20; // Vorher 32
-
-  // Radius ist ca. 1/3 kleiner
-  int sonnenRadius = 7; // Vorher 10
-
-  uint16_t sonnenFarbe = dma_display->color565(255, 255, 0);
-
-  // 1. Die gelbe Kugel (immer sichtbar)
-  dma_display->fillCircle(centerX, centerY, sonnenRadius, sonnenFarbe);
-
-  // 2. Die Strahlen (nur zeichnen, wenn der Status > 0 ist)
-  if (strahlStatus > 0)
-  {
-
-    // Strahlenlänge ist ca. 1/3 kleiner
-    int strahlLaenge = strahlStatus * 4;      // Vorher strahlStatus * 5
-    int strahlStartOffset = sonnenRadius + 2; // Startet 2px außerhalb der Kugel
-
-    for (int i = 0; i < 6; i++)
-    {
-      float winkel = (i * 60.0) * (M_PI / 180.0);
-
-      // Startpunkt (am Rand der Kugel)
-      int x_start = centerX + cos(winkel) * strahlStartOffset;
-      int y_start = centerY + sin(winkel) * strahlStartOffset;
-
-      // Endpunkt (wächst mit dem Status)
-      int x_end = centerX + cos(winkel) * (strahlStartOffset + strahlLaenge);
-      int y_end = centerY + sin(winkel) * (strahlStartOffset + strahlLaenge);
-
-      dma_display->drawLine(x_start, y_start, x_end, y_end, sonnenFarbe);
-    }
-  }
-}
-
-// NEU: Wetter-Funktion hier einfügen, damit sie existiert!
-void zeichneWetter(int x, int y)
-{
-  if (g_temperatur == -99.0)
-    return; // Noch keine Daten
-
-  uint16_t farbe = dma_display->color565(255, 255, 255);
-  if (g_temperatur < 10)
-    farbe = dma_display->color565(0, 100, 255);
-  if (g_temperatur > 25)
-    farbe = dma_display->color565(255, 100, 0);
-
-  dma_display->setTextSize(1);
-  dma_display->setTextColor(farbe);
-  dma_display->setCursor(x, y);
-  dma_display->print((int)round(g_temperatur));
-  dma_display->write(247); // Grad-Zeichen
-  dma_display->print("C");
-}
-// Zohair
 
 // Helper to determine next state in the cycle
 DisplayState getNextState(DisplayState current) {
@@ -637,67 +431,105 @@ DisplayState getNextState(DisplayState current) {
 void updateDisplay()
 {
   unsigned long jetzt = millis();
+  
+  // STATICS für Redraw-Logic (Optimierung gegen Flackern/Smearing)
+  static DisplayState lastProcessedState = STATE_MAIN; // Track state changes
+  static String lastTimeStr = "";
+  static int lastTemp = -999;
+  static int lastPower = -999;
+  static bool triggerFadeIn = false; // Trigger für FadeIn NACH dem Zeichnen
 
   // --- 1. STATE MACHINE TRANSITIONS ---
   switch (currentState) {
     case STATE_MAIN:
       if (jetzt - stateTimer >= DURATION_MAIN) {
-        currentState = STATE_LOGO;
+        renderer->fadeOut(0);
+        currentState = STATE_LOGO; 
         stateTimer = jetzt;
-        dma_display->fillScreen(0); // Clear screen on transition
+        renderer->clearScreen();
+        triggerFadeIn = true;
       }
       break;
 
     case STATE_LOGO:
       if (jetzt - stateTimer >= DURATION_LOGO) {
+        renderer->fadeOut(0);
         currentState = STATE_FULLSCREEN;
         stateTimer = jetzt;
-        dma_display->fillScreen(0);
+        renderer->clearScreen();
+        triggerFadeIn = true;
       }
       break;
 
     case STATE_FULLSCREEN:
       if (jetzt - stateTimer >= DURATION_FULLSCREEN) {
-        currentState = STATE_AKKU2; // Transition to Akku2
+        renderer->fadeOut(0);
+        currentState = STATE_AKKU2; 
         stateTimer = jetzt;
-        dma_display->fillScreen(0);
+        renderer->clearScreen();
+        triggerFadeIn = true;
       }
       break;
 
     case STATE_AKKU2:
       if (jetzt - stateTimer >= DURATION_AKKU2) {
+        renderer->fadeOut(0);
         currentState = STATE_TIME_LARGE;
         stateTimer = jetzt;
-        dma_display->fillScreen(0);
+        renderer->clearScreen();
+        triggerFadeIn = true;
       }
       break;
 
     case STATE_TIME_LARGE:
       if (jetzt - stateTimer >= DURATION_TIME_LARGE) {
+        renderer->fadeOut(0);
         currentState = STATE_TEMP_LARGE;
         stateTimer = jetzt;
-        dma_display->fillScreen(0);
+        renderer->clearScreen();
+        triggerFadeIn = true;
       }
       break;
 
     case STATE_TEMP_LARGE:
       if (jetzt - stateTimer >= DURATION_TEMP_LARGE) {
+        renderer->fadeOut(0);
         currentState = STATE_POWER_LARGE;
         stateTimer = jetzt;
-        dma_display->fillScreen(0);
+        renderer->clearScreen();
+        triggerFadeIn = true;
       }
       break;
 
     case STATE_POWER_LARGE:
       if (jetzt - stateTimer >= DURATION_POWER_LARGE) {
-        currentState = STATE_MAIN; // Back to start
+        renderer->fadeOut(0);
+        currentState = STATE_MAIN; 
         stateTimer = jetzt;
-        dma_display->fillScreen(0);
+        renderer->clearScreen();
+        triggerFadeIn = true;
       }
       break;
   }
 
-  // --- 2. STATE DRAWING ---
+  // --- 2. PREPARE DRAWING (CLEAR SCREEN ON CHANGE) ---
+  bool stateChanged = (currentState != lastProcessedState);
+  
+  // Wenn sich der State geändert hat, resetten wir die Tracker
+  // damit beim ersten Mal im neuen State sicher gezeichnet wird
+  if (stateChanged) {
+      lastProcessedState = currentState;
+      lastTimeStr = "";
+      lastTemp = -999;
+      lastPower = -999;
+      // Einmaliges Löschen beim State-Wechsel ist ok
+      renderer->clearScreen(); 
+  }
+
+  // HINWEIS: Wir löschen NICHT mehr pauschal fillScreen(0) bei Transition im Switch!
+  // Das erledigt oben der "if (currentState != lastProcessedState)" Block.
+  
+  // --- 3. STATE DRAWING ---
   switch (currentState) {
     case STATE_MAIN:
       // Linkes Panel (Grafiken) löschen
@@ -707,11 +539,11 @@ void updateDisplay()
       // Zohair
       //  Wir rufen unsere neue Funktion auf und übergeben ihr
       //  den aktuellen Animations-Status
-      zeichneSonne(sonnenStrahlStatus);
+      renderer->drawSun(sysState.sonnenStrahlStatus);
       // akku auffüllen
-      zeichneAkku();
+      renderer->drawBattery(sysState);
       // Zohair
-      zeichneUhrzeit();
+      renderer->drawClock();
       // Rechtes Panel (Text) löschen
       dma_display->fillRect(64, 0, 64, 64, 0);
       ///*
@@ -722,20 +554,20 @@ void updateDisplay()
       dma_display->setCursor(1 + 64, 2);
       dma_display->print("SOC:");
       dma_display->setCursor(28 + 64, 2);
-      dma_display->print(g_batt_soc, 1); // 1 Nachkommastelle
+      dma_display->print(sysState.batt_soc, 1); // 1 Nachkommastelle
       dma_display->print("%");
 
       dma_display->setTextColor(dma_display->color565(0, 200, 255)); // Cyan
       dma_display->setCursor(1 + 64, 12);
       dma_display->print("Batt:");
       dma_display->setCursor(28 + 64, 12);
-      dma_display->print(g_batt_voltage, 2); // 2 Nachkommastellen
+      dma_display->print(sysState.batt_voltage, 2); // 2 Nachkommastellen
       dma_display->print("V");
 
       dma_display->setCursor(1 + 64, 22);
       dma_display->print("Last:");
       dma_display->setCursor(28 + 64, 22);
-      dma_display->print(g_batt_current, 1);
+      dma_display->print(sysState.batt_current, 1);
       dma_display->print("A");
 
       // --- PV-Laderegler ---
@@ -743,20 +575,20 @@ void updateDisplay()
       dma_display->setCursor(1 + 64, 36);
       dma_display->print("PV1:");
       dma_display->setCursor(28 + 64, 36);
-      dma_display->print(g_pv1_voltage, 1);
+      dma_display->print(sysState.pv1_voltage, 1);
       dma_display->print("V");
 
       dma_display->setCursor(1 + 64, 46);
       dma_display->print("PV2:");
       dma_display->setCursor(28 + 64, 46);
-      dma_display->print(g_pv2_voltage, 1);
+      dma_display->print(sysState.pv2_voltage, 1);
       dma_display->print("V");
       //*/
 
       // 3tes Panel
       //  3tes Panel (Text) löschen
       dma_display->fillRect(128, 0, 64, 64, 0);
-      zeichneWetter(138, 22);
+      renderer->drawWeather(sysState, 138, 22);
       dma_display->setTextColor(dma_display->color565(255, 200, 200)); //
       // dma_display->setCursor(1+128, 12);
       // dma_display->print("hallo");
@@ -765,7 +597,7 @@ void updateDisplay()
       dma_display->setCursor(1 + 128, 0);
       //dma_display->print("༼ つ ◕_◕ ༽つ");
 
-      dma_display->print(int(round(g_batt_power)));
+      dma_display->print(int(round(sysState.pv_power)));
       dma_display->print("W");
       break;
 
@@ -784,7 +616,7 @@ void updateDisplay()
         }
         
         unsigned long duration = micros() - startDraw;
-        Serial.printf("Frame %d Draw Time: %lu us\n", currentFrameIndex, duration); // Debug
+        //Serial.printf("Frame %d Draw Time: %lu us\n", currentFrameIndex, duration); // Debug
 
         currentFrameIndex++;
         if (currentFrameIndex >= FRAME_COUNT) {
@@ -802,7 +634,7 @@ void updateDisplay()
         lastDisplayUpdate = 0;              // Force immediate update
         lastMqttReconnectAttempt = jetzt;   // Delay MQTT check by 5s
         
-        dma_display->fillScreen(0);
+        renderer->clearScreen();
       }
       break;
 
@@ -811,40 +643,67 @@ void updateDisplay()
       break;
 
     case STATE_FULLSCREEN:
-      // Placeholder for Fullscreen Mode
-      // You can implement your slideshow logic here
-      dma_display->setTextSize(2);
-      dma_display->setTextColor(dma_display->color565(255, 50, 255)); // Magenta
-      dma_display->setCursor(2, 0);
-      dma_display->print("Energie Generiert heute:");
-      dma_display->setCursor(1, 34);
-      dma_display->setTextSize(1);
-      dma_display->setTextColor(dma_display->color565(167, 165, 232)); //lavendel
-      dma_display->print("100 Handyladungen ");
+      {
+         // 54x54 QR Code. Display height 64.
+         // Center on the 3-panel display (192 width).
+         // X = (192 - 54) / 2 = 69
+         // Y = (64 - 54) / 2 = 5
+         
+         // Clear screen first (redundant but safe)
+         // dma_display->fillScreen(0); 
+         
+         int x = (PANEL_WIDTH * PANELS_CHAINED - QR_WIDTH) / 2;
+         int y = (PANEL_HEIGHT - QR_HEIGHT) / 2;
+         
+         dma_display->drawBitmap(x, y, qrcode_bitmap, QR_WIDTH, QR_HEIGHT, dma_display->color565(255, 255, 255));
+      }
       break;
 
     case STATE_AKKU2:
-      zeichneAkku2();
+      renderer->drawBattery2(sysState, stateChanged);
       break;
 
     case STATE_TIME_LARGE:
       {
-        dma_display->setFont(&FreeMonoBold24pt7b);
+        dma_display->setFont(&IBMPlexMono24pt7b);
         dma_display->setTextColor(dma_display->color565(255, 255, 255));
         dma_display->setTextSize(1);
 
         struct tm timeinfo;
         if (getLocalTime(&timeinfo)) {
-            char timeString[6];
-            strftime(timeString, sizeof(timeString), "%H:%M", &timeinfo);
-            
-            int16_t x1, y1;
-            uint16_t w, h;
-            dma_display->getTextBounds(timeString, 0, 0, &x1, &y1, &w, &h);
-            int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
-            int y = (PANEL_HEIGHT + h) / 2; 
-            dma_display->setCursor(x, y - 6);  
-            dma_display->print(timeString);
+            char timeBuffer[6];
+            strftime(timeBuffer, sizeof(timeBuffer), "%H:%M", &timeinfo);
+            String timeString = String(timeBuffer);
+
+            // Redraw NUR wenn sich die Zeit geändert hat (z.B. Minute umgesprungen)
+            if (timeString != lastTimeStr) {
+                // Alten Text gezielt löschen (Schwarz übermalen) statt ganzem Screen Clear
+                if (lastTimeStr.length() > 0) {
+                     int16_t x1_old, y1_old;
+                     uint16_t w_old, h_old;
+                     dma_display->getTextBounds(lastTimeStr, 0, 0, &x1_old, &y1_old, &w_old, &h_old);
+                     int x_old = (PANEL_WIDTH * PANELS_CHAINED - w_old) / 2;
+                     int y_old = (PANEL_HEIGHT - h_old) / 2 - y1_old;
+                     dma_display->setTextColor(0); 
+                     dma_display->setCursor(x_old, y_old); 
+                     dma_display->print(lastTimeStr);
+                     
+                     // Farbe wieder auf Weiß setzen
+                     dma_display->setTextColor(dma_display->color565(255, 255, 255));
+                }
+                // (Optional: Fallback sicherheitshalber Ränder putzen, aber meist unnötig)
+                // dma_display->fillRect(0, 0, PANEL_WIDTH * PANELS_CHAINED, PANEL_HEIGHT, 0);
+
+                int16_t x1, y1;
+                uint16_t w, h;
+                dma_display->getTextBounds(timeString, 0, 0, &x1, &y1, &w, &h);
+                int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
+                int y = (PANEL_HEIGHT - h) / 2 - y1; 
+                dma_display->setCursor(x, y);  
+                dma_display->print(timeString);
+                
+                lastTimeStr = timeString; // Merken
+            }
         } else {
              dma_display->setFont(NULL);
              dma_display->setCursor(0, 0);
@@ -855,63 +714,129 @@ void updateDisplay()
 
     case STATE_TEMP_LARGE:
       {
-        dma_display->setFont(&FreeMonoBold24pt7b);
-        dma_display->setTextColor(dma_display->color565(255, 255, 255));
-        dma_display->setTextSize(1);
+        int tempNow = (int)round(sysState.temperature);
         
-        String tempVal = String((int)round(g_temperatur));
-        // Wir zeichnen "25", dann einen Kreis, dann "C"
-        
-        int16_t x1, y1;
-        uint16_t wNum, hNum;
-        dma_display->getTextBounds(tempVal, 0, 0, &x1, &y1, &wNum, &hNum);
-        
-        uint16_t wC, hC;
-        dma_display->getTextBounds("C", 0, 0, &x1, &y1, &wC, &hC);
-        
-        int gap = 15; // Platz für den Kreis
-        int totalW = wNum + gap + wC;
-        
-        int xStart = (PANEL_WIDTH * PANELS_CHAINED - totalW) / 2;
-        int yStart = (PANEL_HEIGHT + hNum) / 2;
-        
-        // 1. Zahl
-        dma_display->setCursor(xStart, yStart - 6);
-        dma_display->print(tempVal);
-        
-        // 2. Kreis (manuell)
-        int r = 3;
-        int xCircle = xStart + wNum + 12; 
-        int yCircle = yStart - 6 - 20; // Etwas höher als die Mitte
-        
-        uint16_t c = dma_display->color565(255, 255, 255);
-        dma_display->drawCircle(xCircle, yCircle, r, c);
-        dma_display->drawCircle(xCircle, yCircle, r-1, c); // Etwas dicker
-        
-        // 3. "C"
-        dma_display->setCursor(xStart + wNum + gap, yStart - 6);
-        dma_display->print("C");
+        // Redraw NUR bei Änderung
+        if (tempNow != lastTemp) {
+             // Clear Band only (Mitte) um Flackern zu reduzieren
+             renderer->clearRect(0, 10, PANEL_WIDTH * PANELS_CHAINED, 44);
+
+            dma_display->setFont(&IBMPlexMono24pt7b);
+            dma_display->setTextColor(dma_display->color565(255, 255, 255));
+            dma_display->setTextSize(1);
+            
+            String tempVal = String(tempNow);
+            // Wir zeichnen "25", dann einen Kreis, dann "C"
+            
+            int16_t x1, y1;
+            uint16_t wNum, hNum;
+            dma_display->getTextBounds(tempVal, 0, 0, &x1, &y1, &wNum, &hNum);
+            
+            uint16_t wC, hC;
+            dma_display->getTextBounds("C", 0, 0, &x1, &y1, &wC, &hC);
+            
+            int gap = 15; // Platz für den Kreis
+            int totalW = wNum + gap + wC;
+            
+            int xStart = (PANEL_WIDTH * PANELS_CHAINED - totalW) / 2;
+            int yStart = (PANEL_HEIGHT - hNum) / 2 - y1;
+            
+            // 1. Zahl
+            dma_display->setCursor(xStart, yStart);
+            dma_display->print(tempVal);
+            
+            // 2. Kreis (manuell)
+            int r = 3;
+            int xCircle = xStart + wNum + 12; 
+            int yCircle = yStart - 20; // Etwas höher als die baseline
+            
+            uint16_t c = dma_display->color565(255, 255, 255);
+            dma_display->drawCircle(xCircle, yCircle, r, c);
+            dma_display->drawCircle(xCircle, yCircle, r-1, c); // Etwas dicker
+            
+            // 3. "C"
+            dma_display->setCursor(xStart + wNum + gap, yStart);
+            dma_display->print("C");
+            
+            lastTemp = tempNow;
+        }
       }
       break;
 
     case STATE_POWER_LARGE:
       {
-         dma_display->setFont(&FreeMonoBold24pt7b);
-         dma_display->setTextColor(dma_display->color565(255, 255, 255));
-         dma_display->setTextSize(1);
+         int pwrNow = (int)round(sysState.pv_power);
+         
+         if (pwrNow != lastPower) {
+             // Clear Band only
+             renderer->clearRect(0, 10, PANEL_WIDTH * PANELS_CHAINED, 44);
 
-         String pwrStr = String((int)round(g_batt_power)) + "W";
-
-         int16_t x1, y1;
-         uint16_t w, h;
-         dma_display->getTextBounds(pwrStr, 0, 0, &x1, &y1, &w, &h);
-         int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
-         int y = (PANEL_HEIGHT + h) / 2;
-         dma_display->setCursor(x, y - 6);
-         dma_display->print(pwrStr);
+             dma_display->setFont(&IBMPlexMono24pt7b);
+             dma_display->setTextColor(dma_display->color565(255, 255, 255));
+             dma_display->setTextSize(1);
+    
+             String pwrStr = String(pwrNow) + "W";
+    
+             int16_t x1, y1;
+             uint16_t w, h;
+             dma_display->getTextBounds(pwrStr, 0, 0, &x1, &y1, &w, &h);
+             int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
+             int y = (PANEL_HEIGHT - h) / 2 - y1;
+             dma_display->setCursor(x, y);
+             dma_display->print(pwrStr);
+             
+             lastPower = pwrNow;
+         }
       }
       break;
   }
+  
+  // --- 4. FADE IN (AFTER DRAWING NEW STATE) ---
+  if (triggerFadeIn) {
+      // Wir faden auf die gewünschte Zielhelligkeit ein
+      renderer->fadeIn(sysState.target_brightness);
+      triggerFadeIn = false;
+  }
+}
+
+// --- Auto Brightness Control ---
+// --- Auto Brightness Control ---
+void updateAutoBrightness() {
+    static int lastTargetStart = -1;
+    static unsigned long lastCheck = 0;
+    
+    // Nur alle 10 Minuten (600000 ms) prüfen, wie gewünscht
+    // Beim ersten Start (lastTargetStart == -1) sofort ausführen
+    if (millis() - lastCheck < 600000 && lastTargetStart != -1) {
+        return;
+    }
+    lastCheck = millis();
+
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo)){
+        return;
+    }
+
+    int hour = timeinfo.tm_hour;
+    int newTarget = 255; 
+
+    // Nachtmodus zwischen 22:00 und 05:00 Uhr
+    if (hour >= 22 || hour < 5) {
+        newTarget = 50;
+    } else {
+        newTarget = 255;
+    }
+
+    if (newTarget != sysState.target_brightness) {
+        sysState.target_brightness = newTarget;
+        Serial.printf("Auto-Helligkeit: Ziel geändert auf %d\n", newTarget);
+        
+        // Initial einmal setzen, sonst macht es der Fade-Loop
+        if (lastTargetStart == -1) {
+             dma_display->setBrightness8(newTarget);
+        }
+        lastTargetStart = newTarget;
+    }
 }
 
 // 5. Setup-Funktion
@@ -937,15 +862,21 @@ void setup()
   mxconfig.gpio.d = 11;
   mxconfig.gpio.e = 9; // Wichtig für 64x64
   mxconfig.gpio.oe = 10;
+  mxconfig.clkphase = false;
+  //mxconfig.latch_blanking = 4;
+  //mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M;
 
   // Erstelle das Display-Objekt mit deiner eigenen Konfiguration
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+  
+  // Renderer initialisieren
+  renderer = new DisplayRenderer(dma_display);
 
   // Starte das Display
   dma_display->begin();
 
   // Stelle eine moderate Helligkeit ein (0-255)
-  dma_display->setBrightness(80);
+  dma_display->setBrightness(160);
 
   // --- PSRAM für PV-Historie reservieren ---
   Serial.printf("Reserviere Speicher im PSRAM für %d Datenpunkte...\n", TOTAL_HISTORY_POINTS);
@@ -1092,6 +1023,8 @@ void loop()
   }
 
   // Zohair
+  
+  updateAutoBrightness(); // Check Brightness
 
   unsigned long currentMillis_Sonne = millis();
 
@@ -1106,17 +1039,17 @@ void loop()
     // Es ist Zeit für den nächsten Schritt
     letzteSonneAnimation = currentMillis_Sonne;
 
-    sonnenStrahlStatus++; // Nächste Wachstumsstufe
+    sysState.sonnenStrahlStatus++; // Nächste Wachstumsstufe
 
     // Wenn Status größer als max (3), zurück auf 0 (Strahlen verschwinden)
-    if (sonnenStrahlStatus > MAX_STRAHL_STATUS)
+    if (sysState.sonnenStrahlStatus > MAX_STRAHL_STATUS)
     {
-      sonnenStrahlStatus = 0;
+      sysState.sonnenStrahlStatus = 0;
     }
   }
   
-  // INA219 Check (jede Sekunde)
-  if (currentMillis_Sonne - lastInaUpdate >= 1000) {
+  // INA219 Check (jede 100ms für schnellere Reaktionszeit)
+  if (currentMillis_Sonne - lastInaUpdate >= 100) {
     lastInaUpdate = currentMillis_Sonne;
     checkWirelessChargingCurrent();
   }
