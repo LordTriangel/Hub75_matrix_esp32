@@ -12,6 +12,14 @@
 #define PANEL_HEIGHT 64
 #define PANELS_CHAINED 3
 
+struct Particle {
+  float x;
+  float y;
+  float speed;
+  uint16_t color;
+  bool active;
+};
+
 class DisplayRenderer {
 public:
     DisplayRenderer(MatrixPanel_I2S_DMA* display);
@@ -21,6 +29,7 @@ public:
     void drawBattery2(const SystemState& state, bool forceRedraw);
     void drawWeather(const SystemState& state, int x, int y);
     void drawClock();
+    void drawMatrix3(const SystemState& state); // [NEW] Matrix 3 Pixel Rain
     
     // Helpers
     void clearScreen();
@@ -35,7 +44,10 @@ private:
     float lastDrawnSoc;
     int lastWChgCnt;
     String lastTimeStr;
+    Particle particles[60]; // [NEW] Particles for rain effect
     
+    int _currentBrightness; // Track current brightness locally
+
     uint16_t color565(uint8_t r, uint8_t g, uint8_t b);
 };
 

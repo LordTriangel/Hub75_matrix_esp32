@@ -16,6 +16,8 @@
 #include "system_state.h"     // [REF] New
 #include "display_renderer.h" // [REF] New
 
+// Global SystemState instance
+SystemState sysState;
 
 
 // I2C Pins für INA219
@@ -47,6 +49,22 @@ HUB75_I2S_CFG mxconfig(
 // Deklariere das Display-Objekt global
 // Es wird in setup() initialisiert
 MatrixPanel_I2S_DMA *dma_display = nullptr;
+
+// --- Externe Hardware & Logik Variablen ---
+Adafruit_INA219 ina219;
+unsigned long lastDisplayUpdate = 0;
+unsigned long currentDisplayInterval = 500; // Standard 500ms
+float current_mA_prev = 0;
+unsigned long lastInaUpdate = 0;
+
+// Wetter Timer
+unsigned long letztesWetterUpdate = 0;
+const unsigned long wetterUpdateInterval = 15 * 60 * 1000; // 15 Min
+
+// Sonne Animation
+unsigned long letzteSonneAnimation = 0;
+const unsigned long sonneAnimationIntervall = 500; // Slower animation (250ms)
+const int MAX_STRAHL_STATUS = 3; 
 
 // WLAN-Einstellungen
 //#define DEBUG_NETWORK // Uncomment for home testing
@@ -103,8 +121,8 @@ DisplayState previousState = STATE_MAIN; // Um zurückzukehren
 unsigned long stateTimer = 0;
 
 // Durations (in milliseconds)
-const unsigned long DURATION_MAIN = 10000;      // 10 seconds
-const unsigned long DURATION_LOGO = 2000;       // 2 seconds
+const unsigned long DURATION_MAIN = 15000;      // 10 seconds
+const unsigned long DURATION_LOGO = 8000;       // 2 seconds
 const unsigned long DURATION_FULLSCREEN = 5000; // 5 seconds
 const unsigned long DURATION_CHARGING = 5000;   // 5 Sekunden GIF abspielen
 const unsigned long DURATION_AKKU2 = 10000;     // 10 seconds
@@ -120,6 +138,7 @@ const int TOTAL_HISTORY_POINTS = HISTORY_POINTS_PER_DAY * HISTORY_DAYS;
 float *g_pv_power_history = nullptr; // Pointer für unser PSRAM-Array
 
 bool ina219_active = false;
+unsigned long lastStateChangeTime = 0; // [FIX] Track transitions
 
 
 // FUNKTION: WETTER ABRUFEN
@@ -185,8 +204,8 @@ void checkWirelessChargingCurrent() {
 
   // Configuration
   const float NOISE_THRESHOLD = 50.0;       // mA: Below this, we update baseline immediately
-  const float ANIMATION_THRESHOLD = 150.0;  // mA: Fast feedback trigger
-  const float DEVICE_THRESHOLD = 400.0;     // mA: Real device detection (0.5A is min usually)
+  const float ANIMATION_THRESHOLD = 200.0;  // mA: Increased to filter 170mA spikes
+  const float DEVICE_THRESHOLD = 250.0;     // mA: Real device detection (0.5A is min usually) [UPDATED: Lowered from 400 to 250]
   const unsigned long STABILIZE_TIMEOUT = 5000; // ms: If value "hangs" in between for 5s, accept it
   
   static float baseline_mA = -1.0; 
@@ -194,8 +213,60 @@ void checkWirelessChargingCurrent() {
   static bool animationTriggeredForThisEvent = false;
   static unsigned long lastEventTime = 0;
 
+  static unsigned long lastPrintTime = 0;
   float current_mA = ina219.getCurrent_mA();
+  unsigned long now = millis();
+
+  if (now - lastPrintTime > 1000) {
+       Serial.printf("Current: %.2f mA | Diff: %.2f\n", current_mA, current_mA - baseline_mA); 
+       lastPrintTime = now;
+  }
   
+  // [FIX] Absolute Low Threshold Failsafe
+  // If current is very low, we assume no device is charging, regardless of logic history.
+  // This handles cases where removal drop was too small or baseline drifted.
+  if (current_mA < 100.0) { // Lowered to 100mA for hysteresis (Add > 150, Valid > 100, Reset < 100)
+      if (sysState.w_chg_cnt > 0) {
+          sysState.w_chg_cnt = 0;
+          Serial.printf("RESET: Current (%.1f mA) below idle threshold. Resetting count to 0.\n", current_mA);
+      }
+      // Ensure baseline tracks this low state so re-connection is detected cleanly
+      baseline_mA = current_mA; 
+      // Do not return here, let the logic flow (diff will be small/zero) but we force count to 0.
+  }
+  
+  // [NEW] Slow Charge Detection (Plateau) for 0 -> 1
+  // Handles cases where current rises slightly (12mA -> 215mA) and stays there.
+  static unsigned long slowChargeStartTime = 0;
+  // Cooldown-Static Definition (Needed here for visibility)
+  static unsigned long lastAnimationTriggerTime = 0;
+
+  if (sysState.w_chg_cnt == 0 && current_mA > 150.0) {
+       if (slowChargeStartTime == 0) slowChargeStartTime = now;
+       if (now - slowChargeStartTime > 3000) {
+            sysState.w_chg_cnt = 1;
+            Serial.printf("DETECT: Slow Charge Plateau Confirmed! Current: %.1f\n", current_mA);
+            
+            baseline_mA = current_mA;
+            lastEventTime = now;
+            slowChargeStartTime = 0;
+            
+            // Trigger Animation Logic
+            if (currentState != STATE_CHARGING_ANIMATION) { 
+                previousState = currentState; 
+                currentState = STATE_CHARGING_ANIMATION;
+                currentState = STATE_CHARGING_ANIMATION;
+                currentDisplayInterval = 33; // 30 FPS for smoothness
+                stateTimer = now;
+                currentFrameIndex = 0;
+                dma_display->fillScreen(0);
+                lastAnimationTriggerTime = now;
+            }
+       }
+  } else {
+       slowChargeStartTime = 0;
+  }
+
   // Initialize Baseline
   if (baseline_mA < 0) {
       baseline_mA = current_mA;
@@ -204,7 +275,7 @@ void checkWirelessChargingCurrent() {
   }
 
   float diff = current_mA - baseline_mA;
-  unsigned long now = millis();
+  // unsigned long now = millis(); // Already defined above
 
   /*
    * LOGIC:
@@ -219,79 +290,112 @@ void checkWirelessChargingCurrent() {
   // --- 1. Interactive Animation Trigger ---
   // If we see a sharp rise, give instant feedback
   // Only if we haven't just triggered (bounce protection) AND we are not in the cooldown of an event
+
+  // Cooldown-Static für Animation
+  // static unsigned long lastAnimationTriggerTime = 0; // Moved up
+
+  // [NEW] Interactive Trigger Debounce
+  // Require 2 consecutive checks (> 200mA) to trigger.
+  static int consecutiveTriggerCounts = 0;
+
   if (diff > ANIMATION_THRESHOLD && !animationTriggeredForThisEvent && (now - lastEventTime > 2000)) {
-       // Only trigger visual if not already running
-       if (currentState != STATE_CHARGING_ANIMATION) {
-          previousState = currentState; 
-          currentState = STATE_CHARGING_ANIMATION;
-          currentDisplayInterval = 20; // Turbo
-          stateTimer = millis();
-          currentFrameIndex = 0;
-          dma_display->fillScreen(0);
-          Serial.println("INTERACTIVE: Animation triggered by current jump!");
+       consecutiveTriggerCounts++;
+       if (consecutiveTriggerCounts >= 2) {
+            // Only trigger visual if not already running AND enough time passed since LAST run (5s cooldown)
+            if (currentState != STATE_CHARGING_ANIMATION && (now - lastAnimationTriggerTime > 5000)) {
+               previousState = currentState; 
+               currentState = STATE_CHARGING_ANIMATION;
+               currentDisplayInterval = 33; // 30 FPS (Smoother than 20ms/50fps)
+               stateTimer = millis();
+               currentFrameIndex = 0;
+               dma_display->fillScreen(0);
+               Serial.println("INTERACTIVE: Animation triggered by confirmed jump!");
+               
+               lastAnimationTriggerTime = millis(); // Cooldown stamp
+            }
+            animationTriggeredForThisEvent = true; 
+            consecutiveTriggerCounts = 0; // Reset
        }
-       animationTriggeredForThisEvent = true; 
+  } else {
+       // Reset count if signal drops or event already triggered
+       // But be careful not to reset if we are just fluctuating slightly above threshold?
+       // Let's reset if diff drops below threshold significantly.
+       if (diff < ANIMATION_THRESHOLD * 0.8) {
+           consecutiveTriggerCounts = 0;
+       }
   }
 
   // --- 2. Device Detection (The "Smart" Part) ---
+  
+  static unsigned long potentialAddStartTime = 0;
+
+  // CHECK: If potentially adding, verify stability
+  if (potentialAddStartTime > 0) {
+      // If signal dropped, it was a spike (e.g. removal)
+      if (diff < DEVICE_THRESHOLD) {
+           Serial.println("SPIKE: Signal dropped before confirmation. Ignoring.");
+           potentialAddStartTime = 0; // Cancel
+           animationTriggeredForThisEvent = false; // Allow re-trigger
+           return;
+      }
+      
+      // If signal sustained for > 1000ms, CONFIRM ADD
+      if (now - potentialAddStartTime > 1000) {
+           sysState.w_chg_cnt++;
+           if (sysState.w_chg_cnt > 2) sysState.w_chg_cnt = 2;
+           Serial.printf("DETECT: Device ADDED CONFIRMED! Count: %d\n", sysState.w_chg_cnt);
+           
+           baseline_mA = current_mA; 
+           lastEventTime = now;
+           potentialAddStartTime = 0; // Reset
+           // animationTriggeredForThisEvent stays true until reset by logic below
+      }
+      return; // Wait for confirmation
+  }
+
+  // --- Normal Detection ---
   if (abs(diff) >= DEVICE_THRESHOLD) {
-      // It's a BIG change!
-      
-      // Debounce: Ensure 5 seconds between "Add" events as requested?
-      // User said: "within 5 seconds no two devices start".
-      // We can just trust the threshold crossing.
-      
       if (diff > 0) {
-          // ADD DEVICE
-           // Prevent double counting if rapid fluctuations? 
-           // Usually acceptable to count up.
-           if (now - lastEventTime > 2000) { // minimal debounce
-              sysState.w_chg_cnt++;
-              if (sysState.w_chg_cnt > 2) sysState.w_chg_cnt = 2;
-              Serial.printf("DETECT: Device ADDED! Count: %d (Diff: %.1f)\n", sysState.w_chg_cnt, diff);
-              
-              baseline_mA = current_mA; 
-              lastEventTime = now;
-              animationTriggeredForThisEvent = false; // Reset for next ones
+          // START ADD SEQUENCE (Wait for stability)
+           // Only if enough time passed since last distinct event
+           if (now - lastEventTime > 2000) { 
+              Serial.println("DETECT: Potential ADD (High Current detected)... Waiting for 1s stability.");
+              potentialAddStartTime = now;
+              // Note: Animation ALREADY triggered above by ANIMATION_THRESHOLD check
            }
       } else {
           // REMOVE DEVICE
           if (now - lastEventTime > 1000) {
-              sysState.w_chg_cnt--;
-              if (sysState.w_chg_cnt < 0) sysState.w_chg_cnt = 0;
-              Serial.printf("DETECT: Device REMOVED! Count: %d (Diff: %.1f)\n", sysState.w_chg_cnt, diff);
               
-              baseline_mA = current_mA; 
-              lastEventTime = now;
-              animationTriggeredForThisEvent = false; 
+              // HYBRID REMOVAL LOGIC
+              // If we have 1 device, and current drops but stays > 100mA, it might be negotiation/throttle.
+              if (sysState.w_chg_cnt == 1 && current_mA > 100.0) {
+                  Serial.printf("IGNORE REMOVAL: Current (%.1f) > 100mA. Assuming negotiation.\n", current_mA);
+                  baseline_mA = current_mA; // Update baseline to new lower level
+                  lastEventTime = now;
+              } else {
+                  // Confirm Removal
+                  sysState.w_chg_cnt--;
+                  if (sysState.w_chg_cnt < 0) sysState.w_chg_cnt = 0;
+                  Serial.printf("DETECT: Device REMOVED! Count: %d (Diff: %.1f)\n", sysState.w_chg_cnt, diff);
+                  
+                  baseline_mA = current_mA; 
+                  lastEventTime = now;
+                  animationTriggeredForThisEvent = false; 
+              }
           }
       }
       lastStabilityCheck = now; // Reset timeouts
-  } 
-  else {
-      // --- 3. Baseline Handling (Small/Medium changes) ---
-      
-      if (abs(diff) < NOISE_THRESHOLD) {
-          // It's just noise/drift. Update baseline gently or directly.
-          // Direct update matches "it's stable".
-          baseline_mA = current_mA;
-          lastStabilityCheck = now; // It is stable
-          
-          if (abs(diff) < 20.0) {
-             animationTriggeredForThisEvent = false; // Reset trigger if very stable (returned to 0 diff)
-          }
-      } 
-      else {
-          // It is in the "Medium" zone (between 50 and 400mA).
-          // This could be a "Ramp in progress" OR "Throttling/Drift".
-          // We HOLD the baseline and wait.
-          
-          if (now - lastStabilityCheck > STABILIZE_TIMEOUT) {
-              // We've been hanging here for 5 seconds. It's not a ramp. It's a new steady state.
-              Serial.printf("STABLE: Adapting to drift/throttling. New Baseline: %.1f\n", current_mA);
-              baseline_mA = current_mA;
-              lastStabilityCheck = now;
-          }
+  } else {
+      // Reset logic if diff is small (but not if we are waiting for add confirmation)
+      if (potentialAddStartTime == 0) {
+           // ... (Existing Baseline Logic) ...
+           if (abs(diff) < NOISE_THRESHOLD) {
+                baseline_mA = current_mA;
+                lastStabilityCheck = now; 
+                if (abs(diff) < 20.0) animationTriggeredForThisEvent = false;
+           } 
+           // ...
       }
   }
   
@@ -512,42 +616,49 @@ void updateDisplay()
       break;
   }
 
-  // --- 2. PREPARE DRAWING (CLEAR SCREEN ON CHANGE) ---
-  bool stateChanged = (currentState != lastProcessedState);
+
+  // --- 2. PREPARE DRAWING (CLEAR SCREEN EVERY FRAME) ---
+  // Double Buffering: We clear the BACK BUFFER every frame.
+  renderer->clearScreen(); 
   
-  // Wenn sich der State geändert hat, resetten wir die Tracker
-  // damit beim ersten Mal im neuen State sicher gezeichnet wird
+  bool stateChanged = (currentState != lastProcessedState);
+      
   if (stateChanged) {
       lastProcessedState = currentState;
       lastTimeStr = "";
       lastTemp = -999;
       lastPower = -999;
-      // Einmaliges Löschen beim State-Wechsel ist ok
-      renderer->clearScreen(); 
+      // Fade Logic reset? No, relying on loop logic.
   }
-
-  // HINWEIS: Wir löschen NICHT mehr pauschal fillScreen(0) bei Transition im Switch!
-  // Das erledigt oben der "if (currentState != lastProcessedState)" Block.
   
-  // --- 3. STATE DRAWING ---
+  // --- 3. DRAWING ---
   switch (currentState) {
     case STATE_MAIN:
-      // Linkes Panel (Grafiken) löschen
-      dma_display->setFont(NULL); // Sicherstellen, dass Standard-Font genutzt wird
-      dma_display->fillRect(0, 0, 64, 64, 0);
+      // Interval auf 30ms für Animation
+      currentDisplayInterval = 30;
 
-      // Zohair
-      //  Wir rufen unsere neue Funktion auf und übergeben ihr
-      //  den aktuellen Animations-Status
+      // Matrix 1 & 2 (Static / Slow)
+      // With Double Buffering, we MUST redraw everything every frame.
+      // (Global ClearScreen handles background, we just draw content)
+      
+      // Linkes Panel (Grafiken) already cleared by global clear.
+      
       renderer->drawSun(sysState.sonnenStrahlStatus);
-      // akku auffüllen
       renderer->drawBattery(sysState);
-      // Zohair
       renderer->drawClock();
-      // Rechtes Panel (Text) löschen
-      dma_display->fillRect(64, 0, 64, 64, 0);
-      ///*
+      
+      // Rechtes Panel (Text) already cleared.
+      
       dma_display->setTextSize(1);
+      // ... (Rest of drawing code follows, standard text drawing)
+      // Note: I need to duplicate the drawing code here or just let it fall through?
+      // The previous code had `///*` and `//*/` blocks.
+      // I need to ensure I don't delete the drawing logic itself.
+      // The `startLine` was 626.
+      // Let's replace the BLOCK start.
+      
+      // --- Saftkiste --- (This was inside the throttle block, logic must be kept)
+
 
       // --- Saftkiste ---
       dma_display->setTextColor(dma_display->color565(0, 255, 100)); // Grün
@@ -584,44 +695,44 @@ void updateDisplay()
       dma_display->print(sysState.pv2_voltage, 1);
       dma_display->print("V");
       //*/
-
-      // 3tes Panel
-      //  3tes Panel (Text) löschen
-      dma_display->fillRect(128, 0, 64, 64, 0);
-      renderer->drawWeather(sysState, 138, 22);
-      dma_display->setTextColor(dma_display->color565(255, 200, 200)); //
-      // dma_display->setCursor(1+128, 12);
-      // dma_display->print("hallo");
-      dma_display->setTextSize(2);
-      //dma_display->setFont()
-      dma_display->setCursor(1 + 128, 0);
-      //dma_display->print("༼ つ ◕_◕ ༽つ");
-
-      dma_display->print(int(round(sysState.pv_power)));
-      dma_display->print("W");
+      // 3tes Panel (128-191) - ALWAYS Refresh (30ms)
+      // Wir löschen hier NICHT "fillRect", da drawMatrix3() Pixel einzeln zeichnet 
+      // und den Rest des Panels (Rain) managed.
+      // Aber: drawMatrix3 schreibt Text und Pixel, überschreibt aber nicht alles schwarz.
+      // Da wir einen Regeneffekt wollen (Trail?), ist "nicht löschen" gut.
+      // Aber: Der Text muss sauber bleiben.
+      // Die drawMatrix3 Funktion sollte idealerweise "clear" machen oder wir machen es hier leicht transparent (Fade effect).
+      dma_display->fillRect(128, 0, 64, 64, 0); // Full Clear for now to prevent smear, improve later for trails
+      
+      renderer->drawMatrix3(sysState);
+      
+      // [FIX] Add State Transition Logic for STATE_MAIN
+      // duration 20s or 60s? Default was usually 15-20s.
+      if (jetzt - stateTimer >= DURATION_MAIN) {
+          renderer->fadeOut(0);
+          currentState = STATE_LOGO; 
+          stateTimer = jetzt;
+          renderer->clearScreen();
+          triggerFadeIn = true;
+          currentDisplayInterval = 200; // Reset refresh rate
+      }
       break;
 
     case STATE_CHARGING_ANIMATION:
-      // Animation abspielen (einfach Frames durchwechseln)
+      // Logic: Advance Frame if time passed
       if (jetzt - lastFrameTime >= FRAME_DELAY) {
         lastFrameTime = jetzt;
-        
-        unsigned long startDraw = micros();
-        
-        // Entscheide Quelle: PSRAM oder Flash
-        if (psramInitialized) {
-             dma_display->drawRGBBitmap(0, 0, frames_psram[currentFrameIndex], FRAME_WIDTH, FRAME_HEIGHT);
-        } else {
-             dma_display->drawRGBBitmap(0, 0, animation_frames[currentFrameIndex], FRAME_WIDTH, FRAME_HEIGHT);
-        }
-        
-        unsigned long duration = micros() - startDraw;
-        //Serial.printf("Frame %d Draw Time: %lu us\n", currentFrameIndex, duration); // Debug
-
         currentFrameIndex++;
         if (currentFrameIndex >= FRAME_COUNT) {
           currentFrameIndex = 0; // Loop
         }
+      }
+      
+      // Drawing: ALWAYS draw the current frame (Double Buffering)
+      if (psramInitialized) {
+           dma_display->drawRGBBitmap(0, 0, frames_psram[currentFrameIndex], FRAME_WIDTH, FRAME_HEIGHT);
+      } else {
+           dma_display->drawRGBBitmap(0, 0, animation_frames[currentFrameIndex], FRAME_WIDTH, FRAME_HEIGHT);
       }
 
       // Prüfen ob Zeit abgelaufen ist
@@ -660,7 +771,8 @@ void updateDisplay()
       break;
 
     case STATE_AKKU2:
-      renderer->drawBattery2(sysState, stateChanged);
+      // Force Redraw every frame for Double Buffering
+      renderer->drawBattery2(sysState, true); 
       break;
 
     case STATE_TIME_LARGE:
@@ -675,35 +787,21 @@ void updateDisplay()
             strftime(timeBuffer, sizeof(timeBuffer), "%H:%M", &timeinfo);
             String timeString = String(timeBuffer);
 
-            // Redraw NUR wenn sich die Zeit geändert hat (z.B. Minute umgesprungen)
-            if (timeString != lastTimeStr) {
-                // Alten Text gezielt löschen (Schwarz übermalen) statt ganzem Screen Clear
-                if (lastTimeStr.length() > 0) {
-                     int16_t x1_old, y1_old;
-                     uint16_t w_old, h_old;
-                     dma_display->getTextBounds(lastTimeStr, 0, 0, &x1_old, &y1_old, &w_old, &h_old);
-                     int x_old = (PANEL_WIDTH * PANELS_CHAINED - w_old) / 2;
-                     int y_old = (PANEL_HEIGHT - h_old) / 2 - y1_old;
-                     dma_display->setTextColor(0); 
-                     dma_display->setCursor(x_old, y_old); 
-                     dma_display->print(lastTimeStr);
-                     
-                     // Farbe wieder auf Weiß setzen
-                     dma_display->setTextColor(dma_display->color565(255, 255, 255));
-                }
-                // (Optional: Fallback sicherheitshalber Ränder putzen, aber meist unnötig)
-                // dma_display->fillRect(0, 0, PANEL_WIDTH * PANELS_CHAINED, PANEL_HEIGHT, 0);
+             // Redraw ALWAYS (Double Buffering)
+             // ClearRect not needed, full screen cleared at start.
+             
+             // Alten Text löschen? Unnötig, Screen ist leer.
+             // Wir zeichnen einfach neu.
 
-                int16_t x1, y1;
-                uint16_t w, h;
-                dma_display->getTextBounds(timeString, 0, 0, &x1, &y1, &w, &h);
-                int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
-                int y = (PANEL_HEIGHT - h) / 2 - y1; 
-                dma_display->setCursor(x, y);  
-                dma_display->print(timeString);
-                
-                lastTimeStr = timeString; // Merken
-            }
+             int16_t x1, y1;
+             uint16_t w, h;
+             dma_display->getTextBounds(timeString, 0, 0, &x1, &y1, &w, &h);
+             int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
+             int y = (PANEL_HEIGHT - h) / 2 - y1; 
+             dma_display->setCursor(x, y);  
+             dma_display->print(timeString);
+             
+             lastTimeStr = timeString; 
         } else {
              dma_display->setFont(NULL);
              dma_display->setCursor(0, 0);
@@ -716,50 +814,47 @@ void updateDisplay()
       {
         int tempNow = (int)round(sysState.temperature);
         
-        // Redraw NUR bei Änderung
-        if (tempNow != lastTemp) {
-             // Clear Band only (Mitte) um Flackern zu reduzieren
-             renderer->clearRect(0, 10, PANEL_WIDTH * PANELS_CHAINED, 44);
-
-            dma_display->setFont(&IBMPlexMono24pt7b);
-            dma_display->setTextColor(dma_display->color565(255, 255, 255));
-            dma_display->setTextSize(1);
-            
-            String tempVal = String(tempNow);
-            // Wir zeichnen "25", dann einen Kreis, dann "C"
-            
-            int16_t x1, y1;
-            uint16_t wNum, hNum;
-            dma_display->getTextBounds(tempVal, 0, 0, &x1, &y1, &wNum, &hNum);
-            
-            uint16_t wC, hC;
-            dma_display->getTextBounds("C", 0, 0, &x1, &y1, &wC, &hC);
-            
-            int gap = 15; // Platz für den Kreis
-            int totalW = wNum + gap + wC;
-            
-            int xStart = (PANEL_WIDTH * PANELS_CHAINED - totalW) / 2;
-            int yStart = (PANEL_HEIGHT - hNum) / 2 - y1;
-            
-            // 1. Zahl
-            dma_display->setCursor(xStart, yStart);
-            dma_display->print(tempVal);
-            
-            // 2. Kreis (manuell)
-            int r = 3;
-            int xCircle = xStart + wNum + 12; 
-            int yCircle = yStart - 20; // Etwas höher als die baseline
-            
-            uint16_t c = dma_display->color565(255, 255, 255);
-            dma_display->drawCircle(xCircle, yCircle, r, c);
-            dma_display->drawCircle(xCircle, yCircle, r-1, c); // Etwas dicker
-            
-            // 3. "C"
-            dma_display->setCursor(xStart + wNum + gap, yStart);
-            dma_display->print("C");
-            
-            lastTemp = tempNow;
-        }
+         // Redraw ALWAYS (Double Buffering)
+         // if (tempNow != lastTemp) { // REMOVED optimization
+             
+             dma_display->setFont(&IBMPlexMono24pt7b);
+             dma_display->setTextColor(dma_display->color565(255, 255, 255));
+             dma_display->setTextSize(1);
+             
+             String tempVal = String(tempNow);
+             
+             int16_t x1, y1;
+             uint16_t wNum, hNum;
+             dma_display->getTextBounds(tempVal, 0, 0, &x1, &y1, &wNum, &hNum);
+             
+             uint16_t wC, hC;
+             dma_display->getTextBounds("C", 0, 0, &x1, &y1, &wC, &hC);
+             
+             int gap = 15; // Platz für den Kreis
+             int totalW = wNum + gap + wC;
+             
+             int xStart = (PANEL_WIDTH * PANELS_CHAINED - totalW) / 2;
+             int yStart = (PANEL_HEIGHT - hNum) / 2 - y1;
+             
+             // 1. Zahl
+             dma_display->setCursor(xStart, yStart);
+             dma_display->print(tempVal);
+             
+             // 2. Kreis (manuell)
+             int r = 3;
+             int xCircle = xStart + wNum + 12; 
+             int yCircle = yStart - 20; // Etwas höher als die baseline
+             
+             uint16_t c = dma_display->color565(255, 255, 255);
+             dma_display->drawCircle(xCircle, yCircle, r, c);
+             dma_display->drawCircle(xCircle, yCircle, r-1, c); // Etwas dicker
+             
+             // 3. "C"
+             dma_display->setCursor(xStart + wNum + gap, yStart);
+             dma_display->print("C");
+             
+             lastTemp = tempNow;
+         // }
       }
       break;
 
@@ -767,37 +862,41 @@ void updateDisplay()
       {
          int pwrNow = (int)round(sysState.pv_power);
          
-         if (pwrNow != lastPower) {
-             // Clear Band only
-             renderer->clearRect(0, 10, PANEL_WIDTH * PANELS_CHAINED, 44);
-
-             dma_display->setFont(&IBMPlexMono24pt7b);
-             dma_display->setTextColor(dma_display->color565(255, 255, 255));
-             dma_display->setTextSize(1);
-    
-             String pwrStr = String(pwrNow) + "W";
-    
-             int16_t x1, y1;
-             uint16_t w, h;
-             dma_display->getTextBounds(pwrStr, 0, 0, &x1, &y1, &w, &h);
-             int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
-             int y = (PANEL_HEIGHT - h) / 2 - y1;
-             dma_display->setCursor(x, y);
-             dma_display->print(pwrStr);
-             
-             lastPower = pwrNow;
-         }
+          // if (pwrNow != lastPower) { // REMOVED Optimization
+              dma_display->setFont(&IBMPlexMono24pt7b);
+              dma_display->setTextColor(dma_display->color565(255, 255, 255));
+              dma_display->setTextSize(1);
+     
+              
+              int pwrDisplay = abs(pwrNow);
+              String pwrStr = String(pwrDisplay) + "W";
+     
+              int16_t x1, y1;
+              uint16_t w, h;
+              dma_display->getTextBounds(pwrStr, 0, 0, &x1, &y1, &w, &h);
+              int x = (PANEL_WIDTH * PANELS_CHAINED - w) / 2;
+              int y = (PANEL_HEIGHT - h) / 2 - y1;
+              dma_display->setCursor(x, y);
+              dma_display->print(pwrStr);
+              
+              lastPower = pwrNow;
+          // }
       }
       break;
   }
   
-  // --- 4. FADE IN (AFTER DRAWING NEW STATE) ---
+  // [NEW] Flip Buffer to show new frame (Essential for Double Buffering)
+  dma_display->flipDMABuffer(); 
+  
+  // --- 4. FADE IN (AFTER FLIP) ---
   if (triggerFadeIn) {
       // Wir faden auf die gewünschte Zielhelligkeit ein
+      // Jetzt zeig der Front Buffer bereits das neue Bild (noch dunkel)
       renderer->fadeIn(sysState.target_brightness);
       triggerFadeIn = false;
-  }
+  } 
 }
+
 
 // --- Auto Brightness Control ---
 // --- Auto Brightness Control ---
@@ -818,13 +917,13 @@ void updateAutoBrightness() {
     }
 
     int hour = timeinfo.tm_hour;
-    int newTarget = 255; 
+    int newTarget = 180; 
 
     // Nachtmodus zwischen 22:00 und 05:00 Uhr
     if (hour >= 22 || hour < 5) {
         newTarget = 50;
     } else {
-        newTarget = 255;
+        newTarget = 180;
     }
 
     if (newTarget != sysState.target_brightness) {
@@ -867,6 +966,7 @@ void setup()
   //mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M;
 
   // Erstelle das Display-Objekt mit deiner eigenen Konfiguration
+  mxconfig.double_buff = true; // [NEW] Enable Double Buffering to stop flicker
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
   
   // Renderer initialisieren
@@ -907,6 +1007,7 @@ void setup()
 
   // I2C Manuell auf freien Pins starten, damit es nicht mit der Matrix kollidiert (GPIO 8/9)
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000); // 100kHz Standard-Speed für Stabilität
 
   // INA219 Initialisierung
   if (!ina219.begin()) {
@@ -940,6 +1041,31 @@ void setup()
         // Kopiere vom Flash (animation_frames[i]) in den PSRAM (frames_psram[i])
         // memcpy_P kopiert aus dem Programmspeicher
         memcpy_P(frames_psram[i], animation_frames[i], frameSize);
+        
+        // [BRIGHTNESS BOOST]
+        // Iterate through all pixels and double the brightness
+        int pixelCount = FRAME_WIDTH * FRAME_HEIGHT;
+        for (int p = 0; p < pixelCount; p++) {
+            uint16_t color = frames_psram[i][p];
+            
+            // Extract RGB (565 format)
+            int r = (color >> 11) & 0x1F;
+            int g = (color >> 5) & 0x3F;
+            int b = color & 0x1F;
+            
+            // Boost Brightness (Multiplying by 2.0, you can adjust this)
+            r = (int)(r * 2.0);
+            g = (int)(g * 2.0);
+            b = (int)(b * 2.0);
+            
+            // Clamp to max values
+            if (r > 31) r = 31;
+            if (g > 63) g = 63;
+            if (b > 31) b = 31;
+            
+            // Re-pack
+            frames_psram[i][p] = (r << 11) | (g << 5) | b;
+        }
     }
     if (success) {
         Serial.println("Alle Frames erfolgreich in PSRAM geladen!");
@@ -1007,6 +1133,7 @@ void loop()
         // Topics abonnieren
         client.subscribe("Saftkiste/#");
         client.subscribe("chargeController/#");
+        client.subscribe("Anlagendaten/#");
       }
       else
       {
